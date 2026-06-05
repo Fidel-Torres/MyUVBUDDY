@@ -30,12 +30,12 @@ static const uint16_t BLE_CONN_TIMEOUT    = 600u;
 static const float   UVI_THRESHOLD        = 3.0f;
 static const uint8_t THRESHOLD_DEBOUNCE   = 2u;
 
-// LTR390 conversion constants (gain 3, 16-bit resolution)
-// UVI  : counts / 2300
-// Lux  : ALS counts * (0.6 / gain_factor * integration_factor)
-//        For gain=3, res=16-bit: multiply by 0.45
+// LTR390 conversion constants (gain 18, 20-bit / 400 ms integration)
+// UVI  : counts / 2300  — reference sensitivity from Liteon datasheet at GAIN_18 + 20BIT
+// Lux  : ALS counts × (0.6 / (gain × integration_factor))
+//        For GAIN_18, res=20-bit (400 ms): factor = 0.6 / (18 × 4) ≈ 0.0083
 static const uint32_t UV_SENSITIVITY      = 2300u;
-static const float    ALS_LUX_FACTOR      = 0.45f;
+static const float    ALS_LUX_FACTOR      = 0.0083f;
 
 // External signal bitmasks — passed to sl_bt_external_signal()
 // The BLE event loop receives these as sl_bt_evt_system_external_signal_id
@@ -125,6 +125,13 @@ static float als_to_lux(uint32_t als);
 static void  check_uvi_threshold(float uvi);
 
 // =============================================================================
+// Integration hooks — implemented in MotorButton module
+// Call these to activate haptic alert and signal BLE connection state
+// =============================================================================
+extern void triggerUVAlert();
+extern void notifyBLEConnected();
+
+// =============================================================================
 // Setup
 // =============================================================================
 
@@ -143,8 +150,8 @@ void setup()
   if (!g_sensor_ok) {
     Serial.println("[SENSOR] LTR390 not found — check wiring!");
   } else {
-    g_ltr.setGain(LTR390_GAIN_3);
-    g_ltr.setResolution(LTR390_RESOLUTION_16BIT);
+    g_ltr.setGain(LTR390_GAIN_18);
+    g_ltr.setResolution(LTR390_RESOLUTION_20BIT);
     Serial.print("[SENSOR] LTR390 ready — UVI threshold: ");
     Serial.println(UVI_THRESHOLD, 1);
   }
@@ -244,13 +251,13 @@ static bool sensor_read(uint32_t& out_uvs, uint32_t& out_als)
   for (uint8_t attempt = 0; attempt < SENSOR_RETRY_LIMIT; attempt++) {
 
     g_ltr.setMode(LTR390_MODE_ALS);
-    delay(110);
-    if (!g_ltr.newDataAvailable()) delay(50);
+    delay(420);
+    if (!g_ltr.newDataAvailable()) delay(80);
     out_als = g_ltr.readALS();
 
     g_ltr.setMode(LTR390_MODE_UVS);
-    delay(110);
-    if (!g_ltr.newDataAvailable()) delay(50);
+    delay(420);
+    if (!g_ltr.newDataAvailable()) delay(80);
     out_uvs = g_ltr.readUVS();
 
     if (out_als != 0xFFFFFFFF && out_uvs != 0xFFFFFFFF) return true;
@@ -376,6 +383,7 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
           g_ble_state = STATE_SPP_MODE;
           digitalWrite(LED_BUILTIN, LED_BUILTIN_ACTIVE);
           Serial.println("[BLE] Notifications enabled — SPP mode active");
+          notifyBLEConnected();   // ← signal BLE state to MotorButton module
         } else {
           g_ble_state = STATE_CONNECTED;
           digitalWrite(LED_BUILTIN, LED_BUILTIN_INACTIVE);
@@ -398,7 +406,7 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
         const char* alert = "ALERT=UVI_HIGH\n";
         ble_send_chunked((const uint8_t*)alert, strlen(alert));
         digitalWrite(LED_BUILTIN, LED_BUILTIN_ACTIVE);
-        // Add any other alert action here: buzzer, second BLE characteristic, etc.
+        triggerUVAlert();   // ← motor haptic alert (MotorButton module)
       }
 
       if (signals & SIG_UVI_OK) {
