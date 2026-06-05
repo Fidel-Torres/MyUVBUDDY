@@ -147,12 +147,11 @@ static void  reset_session();
 static void  handle_ble_command(const uint8_t* data, uint16_t len);
 
 // =============================================================================
-// Integration hooks — implemented in MotorButton module
-// Linker requires MotorButton.ino in the same PlatformIO src/ folder.
-// Standalone testing: add empty stubs { void triggerUVAlert(){} etc. }
+// Integration — MotorButton module
+// triggerUVAlert() and notifyBLEConnected() are defined in MotorButton.ino
+// motorSetup() is called from setup(), motorLoop() from loop()
+// Arduino IDE compiles all .ino files in the same folder together
 // =============================================================================
-extern void triggerUVAlert();
-extern void notifyBLEConnected();
 
 // =============================================================================
 // Setup
@@ -160,6 +159,8 @@ extern void notifyBLEConnected();
 
 void setup()
 {
+  motorSetup();   // ← MotorButton module init (motor + button + interrupts)
+
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LED_BUILTIN_INACTIVE);
 
@@ -191,6 +192,8 @@ void setup()
 
 void loop()
 {
+  motorLoop();    // ← MotorButton module update (always first, non-blocking)
+
   sl_power_manager_sleep();
 
   if (!g_sensor_read_pending) return;
