@@ -95,7 +95,7 @@
 
 <div class="status-bar">
   <div class="status-dot" id="statusDot"></div>
-  <span id="statusText">Disconnected — press Connect to scan for MYUVBUDDY</span>
+  <span id="statusText">Disconnected - press Connect to scan for MYUVBUDDY</span>
 </div>
 
 <div class="alert-bar" id="alertBar">
@@ -146,7 +146,7 @@
   <div class="sed-bar-wrap">
     <div class="sed-bar-fill" id="sedBar" style="width:0%"></div>
   </div>
-  <div class="sed-info">1 SED = 100 J/m²  ·  dose rate = UVI × 0.025 W/m²  ·  ISO/CIE 17166</div>
+  <div class="sed-info">1 SED = 100 J/m&sup2 dose rate = UVI x 0.025 W/m&sup2 ISO/CIE 17166</div>
 </div>
 
 <!-- UV chart -->
@@ -169,7 +169,7 @@
   <div id="logList" class="log-list">
     <div class="empty">
       <i class="ti ti-sun-off"></i>
-      No data yet — connect your device
+      No data yet - connect your device
     </div>
   </div>
 </div>
@@ -322,9 +322,9 @@ function updateSedBar(sed) {
 
 function parseMsg(raw) {
   if (raw.includes('ALERT=')) {
-    if (raw.includes('ALERT=UVI_HIGH')) setAlert(true,  'UVI above threshold — seek shade');
+    if (raw.includes('ALERT=UVI_HIGH')) setAlert(true,  'UVI above threshold - seek shade');
     if (raw.includes('ALERT=UVI_OK'))   setAlert(false, '');
-    if (raw.includes('ALERT=SED_HIGH')) setAlert(true,  'Daily UV dose limit reached — go inside');
+    if (raw.includes('ALERT=SED_HIGH')) setAlert(true,  'Daily UV dose limit reached - go inside');
     return null;
   }
 
@@ -416,7 +416,7 @@ function updateLog() {
 }
 
 // -----------------------------------------------------------------------------
-// BLE write — sends command to device
+// BLE write - sends command to device
 // -----------------------------------------------------------------------------
 
 async function sendCommand(cmd) {
@@ -429,7 +429,7 @@ async function sendCommand(cmd) {
 }
 
 // -----------------------------------------------------------------------------
-// Session reset — sends RESET to device + clears local state
+// Session reset - sends RESET to device + clears local state
 // -----------------------------------------------------------------------------
 
 async function resetSession() {
@@ -449,7 +449,7 @@ async function resetSession() {
   setAlert(false, '');
 
   document.getElementById('logList').innerHTML =
-    '<div class="empty"><i class="ti ti-sun-off"></i>Session reset — waiting for data</div>';
+    '<div class="empty"><i class="ti ti-sun-off"></i>Session reset - waiting for data</div>';
 
   uvChart.data.labels           = [];
   uvChart.data.datasets[0].data = [];
@@ -510,7 +510,7 @@ async function toggleConnect() {
     });
 
     connected = true;
-    setStatus('live', 'Connected to ' + device.name + ' — receiving data');
+    setStatus('live', 'Connected to ' + device.name + ' - receiving data');
     document.getElementById('connectBtn').className = 'connect-btn connected';
     document.getElementById('btnIcon').className    = 'ti ti-bluetooth-connected';
     document.getElementById('btnLabel').textContent = 'Disconnect';
