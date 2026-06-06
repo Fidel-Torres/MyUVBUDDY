@@ -21,6 +21,8 @@
 #define BUTTON_PIN     D10
 #define DEBOUNCE_MS    50
 #define LONG_PRESS_MS  2000
+#define DOUBLE_TAP_MS  400
+#define SNOOZE_MS      30000
 
 // ─────────────────────────────────────────────
 // PWM LEVELS
@@ -32,9 +34,8 @@
 #define PWM_MAX   255
 
 // ─────────────────────────────────────────────
-// TYPES (CRITICAL: FIXES YOUR ERROR)
+// TYPES
 // ─────────────────────────────────────────────
-
 typedef struct {
     uint8_t  duty;
     uint16_t on_ms;
@@ -56,12 +57,16 @@ typedef enum {
 } motor_state_t;
 
 // ─────────────────────────────────────────────
-// API FUNCTIONS (USED BY Bluetooth2.0.ino)
+// API FUNCTIONS USED BY MyUVBuddyMain.ino
 // ─────────────────────────────────────────────
 void motorSetup();
 void motorLoop();
 
 void triggerUVAlert();
 void notifyBLEConnected();
+void stopHaptic();
+
+void motorSetSedPercent(float percent);
+bool motorTakeBleDisconnectRequest();
 
 #endif
