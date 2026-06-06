@@ -9,6 +9,8 @@
 // - Sensor readings are stored in a local RAM backlog
 // - Backlog is sent slowly after reconnect
 // - Haptic motor is forced OFF on BLE disconnect
+// - Button module supports snooze/acknowledge/SED status/BLE disconnect
+// - Backlog filtering prevents storing repeated unimportant readings
 // - Low-power sleep is disabled during integration debugging
 // =============================================================================
 
@@ -61,8 +63,15 @@ static const uint32_t SIG_UVI_OK          = (1u << 1);
 static const uint32_t SIG_SED_HIGH        = (1u << 2);
 
 // Backlog settings
-#define READ_BACKLOG_SIZE        120
+#define READ_BACKLOG_SIZE        300
 #define BACKLOG_SEND_SPACING_MS  50
+
+// Backlog filtering settings
+#define LOG_UVI_DELTA        0.2f
+#define LOG_LUX_DELTA        10.0f
+#define LOG_UV_RAW_DELTA     10u
+#define LOG_SED_DELTA        0.005f
+#define LOG_HEARTBEAT_MS     60000u
 
 // =============================================================================
 // UUIDs
@@ -162,6 +171,15 @@ static uint16_t g_backlog_count = 0;   // number of unsent readings
 static uint32_t g_sample_seq = 0;
 static unsigned long g_last_backlog_send_ms = 0;
 
+// Last stored reading values for backlog filtering
+static bool g_have_last_stored = false;
+
+static float g_last_stored_uvi = 0.0f;
+static float g_last_stored_lux = 0.0f;
+static uint32_t g_last_stored_uv_raw = 0;
+static float g_last_stored_sed = 0.0f;
+static unsigned long g_last_stored_ms = 0;
+
 // =============================================================================
 // Forward declarations
 // =============================================================================
@@ -183,6 +201,7 @@ static void  check_sed_threshold();
 static void  reset_session();
 static void  handle_ble_command(const uint8_t* data, uint16_t len);
 
+static bool  should_store_reading(float uvi, float lux, uint32_t uv_raw, float sed);
 static void  store_reading(float uvi, float lux, uint32_t uv_raw, float sed);
 static void  clear_backlog();
 static void  send_pending_readings();
@@ -243,6 +262,16 @@ void loop()
   // Motor/button state machine must run frequently.
   motorLoop();
 
+  // Long press can request BLE disconnect from MotorButton.ino
+  if (motorTakeBleDisconnectRequest()) {
+    if (g_conn_handle != SL_BT_INVALID_CONNECTION_HANDLE) {
+      Serial.println("[BLE] Button requested disconnect");
+      sl_bt_connection_close(g_conn_handle);
+    } else {
+      Serial.println("[BLE] Button requested disconnect, but no active connection");
+    }
+  }
+
   // Send stored readings slowly when connected.
   send_pending_readings();
 
@@ -276,8 +305,16 @@ void loop()
 
   accumulate_sed(uvi);
 
-  // Store every reading, even if BLE is disconnected.
-  store_reading(uvi, lux, uvs, g_cumulative_sed);
+  // Update haptic/button module with current SED percentage
+  motorSetSedPercent((g_cumulative_sed / SED_ALERT_THRESHOLD) * 100.0f);
+
+  // Store every reading while connected.
+  // While disconnected, store only significant changes or periodic heartbeat readings.
+  if (should_store_reading(uvi, lux, uvs, g_cumulative_sed)) {
+    store_reading(uvi, lux, uvs, g_cumulative_sed);
+  } else {
+    Serial.println("[LOG] Reading skipped - no significant change");
+  }
 
   Serial.print("[DATA] UVI=");
   Serial.print(uvi, 1);
@@ -311,6 +348,50 @@ static void service_delay(uint32_t ms)
 }
 
 // =============================================================================
+// Backlog filter
+// =============================================================================
+
+static bool should_store_reading(float uvi, float lux, uint32_t uv_raw, float sed)
+{
+  // If BLE is connected and notifications are active, keep sending live samples.
+  if (g_ble_state == STATE_SPP_MODE) {
+    return true;
+  }
+
+  // Always store the first reading after startup/reset.
+  if (!g_have_last_stored) {
+    return true;
+  }
+
+  unsigned long now = millis();
+
+  // Heartbeat: store at least one reading per minute even if values barely change.
+  if (now - g_last_stored_ms >= LOG_HEARTBEAT_MS) {
+    return true;
+  }
+
+  float duvi = uvi - g_last_stored_uvi;
+  if (duvi < 0.0f) duvi = -duvi;
+
+  float dlux = lux - g_last_stored_lux;
+  if (dlux < 0.0f) dlux = -dlux;
+
+  uint32_t duv_raw = (uv_raw > g_last_stored_uv_raw)
+                     ? (uv_raw - g_last_stored_uv_raw)
+                     : (g_last_stored_uv_raw - uv_raw);
+
+  float dsed = sed - g_last_stored_sed;
+  if (dsed < 0.0f) dsed = -dsed;
+
+  if (duvi >= LOG_UVI_DELTA) return true;
+  if (dlux >= LOG_LUX_DELTA) return true;
+  if (duv_raw >= LOG_UV_RAW_DELTA) return true;
+  if (dsed >= LOG_SED_DELTA) return true;
+
+  return false;
+}
+
+// =============================================================================
 // Backlog storage
 // =============================================================================
 
@@ -337,6 +418,14 @@ static void store_reading(float uvi, float lux, uint32_t uv_raw, float sed)
 
   Serial.print("[LOG] Stored reading. Pending = ");
   Serial.println(g_backlog_count);
+
+  // Update filter reference values
+  g_have_last_stored = true;
+  g_last_stored_uvi = uvi;
+  g_last_stored_lux = lux;
+  g_last_stored_uv_raw = uv_raw;
+  g_last_stored_sed = sed;
+  g_last_stored_ms = r.ms;
 }
 
 static void clear_backlog()
@@ -346,6 +435,13 @@ static void clear_backlog()
   g_backlog_count = 0;
   g_sample_seq = 0;
   g_last_backlog_send_ms = 0;
+
+  g_have_last_stored = false;
+  g_last_stored_uvi = 0.0f;
+  g_last_stored_lux = 0.0f;
+  g_last_stored_uv_raw = 0;
+  g_last_stored_sed = 0.0f;
+  g_last_stored_ms = 0;
 
   Serial.println("[LOG] Backlog cleared");
 }
@@ -447,6 +543,8 @@ static void reset_session()
   g_sed_alerted     = false;
   g_above_threshold = false;
   g_threshold_hit_count = 0u;
+
+  motorSetSedPercent(0.0f);
 
   clear_backlog();
 
