@@ -3,11 +3,11 @@
 // ─────────────────────────────────────────────
 // MOTOR PATTERNS
 // ─────────────────────────────────────────────
-static const MotorPattern PAT_UV_ALERT      = { PWM_MAX,  400, 300, 3 };
-static const MotorPattern PAT_SNOOZE        = { PWM_MED,  150, 100, 2 };
-static const MotorPattern PAT_DISMISS       = { PWM_LOW,  100,   0, 1 };
-static const MotorPattern PAT_BLE_PAIRING   = { PWM_MED,  100, 150, 2 };
-static const MotorPattern PAT_BLE_CONNECTED = { PWM_HIGH, 600,   0, 1 };
+static const MotorPattern PAT_UV_ALERT       = { PWM_MAX,  400, 300, 3 };
+static const MotorPattern PAT_SNOOZE         = { PWM_MED,  150, 100, 2 };
+static const MotorPattern PAT_DISMISS        = { PWM_LOW,  100,   0, 1 };
+static const MotorPattern PAT_BLE_PAIRING    = { PWM_MED,  100, 150, 2 };
+static const MotorPattern PAT_BLE_CONNECTED  = { PWM_HIGH, 600,   0, 1 };
 static const MotorPattern PAT_BLE_CANCELLED  = { PWM_LOW,  100,   0, 1 };
 
 // ─────────────────────────────────────────────
@@ -26,15 +26,29 @@ static unsigned long motorLastTime = 0;
 static unsigned long pressStart = 0;
 static unsigned long lastAlertTime = 0;
 
+// New integration state
+static float g_sedPercent = 0.0f;
+static bool g_bleConnected = false;
+static volatile bool g_bleDisconnectRequested = false;
+
+static uint8_t tapCount = 0;
+static unsigned long firstTapTime = 0;
+static unsigned long snoozeUntil = 0;
+
 // ─────────────────────────────────────────────
-// FORWARD DECLARATIONS (fix Arduino parsing issues)
+// FORWARD DECLARATIONS
 // ─────────────────────────────────────────────
 static void motorStart(const MotorPattern& p);
 static void motorOff();
 static void motorUpdate();
 static void alertUpdate();
-static void handleButton(bool longPress);
 static void buttonISR();
+
+static void handleSingleTap();
+static void handleDoubleTap();
+static void handleTripleTap();
+static void handleLongPress();
+static void playSedPercentPattern();
 
 #if DEBUG_MODE
 static void debugUpdate();
@@ -107,6 +121,9 @@ static void alertUpdate() {
     if (systemState != SYS_ALERT) return;
     if (motorState != MOTOR_IDLE) return;
 
+    // If user snoozed the alert, do not repeat until snooze expires
+    if (millis() < snoozeUntil) return;
+
     if (millis() - lastAlertTime >= ALERT_REPEAT_MS) {
         lastAlertTime = millis();
         motorStart(PAT_UV_ALERT);
@@ -118,55 +135,101 @@ static void alertUpdate() {
 // BUTTON ISR
 // ─────────────────────────────────────────────
 static void buttonISR() {
-    if (digitalRead(BUTTON_PIN) == LOW) btnFalling = true;
-    else btnRising = true;
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        btnFalling = true;
+    } else {
+        btnRising = true;
+    }
 }
 
 // ─────────────────────────────────────────────
-// BUTTON HANDLER
+// BUTTON ACTIONS
 // ─────────────────────────────────────────────
-static void handleButton(bool longPress) {
-    switch (systemState) {
+static void handleSingleTap() {
+    if (systemState == SYS_ALERT) {
+        motorOff();
 
-        case SYS_IDLE:
-            if (longPress) {
-                systemState = SYS_BLE_PAIRING;
-                motorStart(PAT_BLE_PAIRING);
-                Serial.println("[BTN] BLE pairing started");
-            }
-            break;
+        // Snooze means pause alert repeats temporarily
+        snoozeUntil = millis() + SNOOZE_MS;
+        lastAlertTime = millis();
 
-        case SYS_ALERT:
-            if (!longPress) {
-                motorOff();
-                lastAlertTime = millis();
-                motorStart(PAT_SNOOZE);
-                Serial.println("[BTN] Alert snoozed");
-            } else {
-                bleNotifyPending = false;
-                motorOff();
-                systemState = SYS_IDLE;
-                motorStart(PAT_DISMISS);
-                Serial.println("[BTN] Alert dismissed");
-            }
-            break;
-
-        case SYS_BLE_PAIRING:
-            if (!longPress) {
-                motorOff();
-                systemState = SYS_IDLE;
-                motorStart(PAT_BLE_CANCELLED);
-                Serial.println("[BTN] Pairing cancelled");
-            }
-            break;
-
-        case SYS_BLE_CONNECTED:
-            if (longPress) {
-                systemState = SYS_IDLE;
-                Serial.println("[BTN] BLE disconnected");
-            }
-            break;
+        motorStart(PAT_SNOOZE);
+        Serial.println("[BTN] Alert snoozed");
+    } else {
+        Serial.println("[BTN] Short tap - no active alert");
     }
+}
+
+static void handleDoubleTap() {
+    if (systemState == SYS_ALERT) {
+        bleNotifyPending = false;
+        motorOff();
+
+        // Stop/acknowledge means leave alert state
+        if (g_bleConnected) {
+            systemState = SYS_BLE_CONNECTED;
+        } else {
+            systemState = SYS_IDLE;
+        }
+
+        snoozeUntil = 0;
+        lastAlertTime = millis();
+
+        motorStart(PAT_DISMISS);
+        Serial.println("[BTN] Alert acknowledged/stopped");
+    } else {
+        Serial.println("[BTN] Double tap - no active alert to stop");
+    }
+}
+
+static void handleTripleTap() {
+    Serial.print("[BTN] Triple tap - SED status: ");
+    Serial.print(g_sedPercent, 1);
+    Serial.println("%");
+
+    motorOff();
+    playSedPercentPattern();
+}
+
+static void handleLongPress() {
+    if (g_bleConnected) {
+        g_bleDisconnectRequested = true;
+        motorOff();
+        motorStart(PAT_BLE_CANCELLED);
+        Serial.println("[BTN] BLE disconnect requested");
+    } else {
+        systemState = SYS_BLE_PAIRING;
+        motorOff();
+        motorStart(PAT_BLE_PAIRING);
+        Serial.println("[BTN] BLE pairing mode");
+    }
+}
+
+static void playSedPercentPattern() {
+    MotorPattern p;
+
+    if (g_sedPercent < 25.0f) {
+        p = { PWM_LOW, 120, 150, 1 };
+        Serial.println("[SED] 0-25% dose");
+    } 
+    else if (g_sedPercent < 50.0f) {
+        p = { PWM_LOW, 120, 150, 2 };
+        Serial.println("[SED] 25-50% dose");
+    } 
+    else if (g_sedPercent < 80.0f) {
+        p = { PWM_MED, 120, 150, 3 };
+        Serial.println("[SED] 50-80% dose");
+    } 
+    else if (g_sedPercent < 100.0f) {
+        p = { PWM_HIGH, 120, 120, 4 };
+        Serial.println("[SED] 80-100% dose");
+    } 
+    else {
+        p = PAT_UV_ALERT;
+        Serial.println("[SED] 100%+ dose");
+    }
+
+    motorStart(p);
 }
 
 // ─────────────────────────────────────────────
@@ -179,11 +242,16 @@ void triggerUVAlert() {
     systemState = SYS_ALERT;
     lastAlertTime = millis();
 
+    // A new real alert cancels any previous snooze
+    snoozeUntil = 0;
+
     motorStart(PAT_UV_ALERT);
     Serial.println("[UV] Alert triggered");
 }
 
 void notifyBLEConnected() {
+    g_bleConnected = true;
+
     if (systemState == SYS_ALERT) {
         bleNotifyPending = true;
         Serial.println("[BLE] Connected pending (alert active)");
@@ -195,12 +263,48 @@ void notifyBLEConnected() {
     Serial.println("[BLE] Connected");
 }
 
+void stopHaptic() {
+    bleNotifyPending = false;
+    g_bleConnected = false;
+    motorOff();
+
+    if (systemState == SYS_BLE_CONNECTED || systemState == SYS_BLE_PAIRING) {
+        systemState = SYS_IDLE;
+    }
+
+    Serial.println("[HAPTIC] Forced off");
+}
+
+void motorSetSedPercent(float percent) {
+    if (percent < 0.0f) {
+        percent = 0.0f;
+    }
+
+    if (percent > 150.0f) {
+        percent = 150.0f;
+    }
+
+    g_sedPercent = percent;
+}
+
+bool motorTakeBleDisconnectRequest() {
+    if (g_bleDisconnectRequested) {
+        g_bleDisconnectRequested = false;
+        return true;
+    }
+
+    return false;
+}
+
 // ─────────────────────────────────────────────
 // SETUP / LOOP
 // ─────────────────────────────────────────────
 void motorSetup() {
     analogWriteResolution(8);
     pinMode(MOTOR_PIN, OUTPUT);
+
+    // Use INPUT if your circuit has external 10k pull-up.
+    // Use INPUT_PULLUP if the button is wired directly D10 → button → GND.
     pinMode(BUTTON_PIN, INPUT);
 
     motorOff();
@@ -240,7 +344,35 @@ void motorLoop() {
             Serial.print(duration);
             Serial.println("ms");
 
-            handleButton(isLong);
+            if (isLong) {
+                tapCount = 0;
+                handleLongPress();
+            } else {
+                if (tapCount == 0) {
+                    firstTapTime = now;
+                }
+
+                tapCount++;
+
+                // Cap at 3 so extra taps do not overflow behavior
+                if (tapCount > 3) {
+                    tapCount = 3;
+                }
+            }
+        }
+    }
+
+    // Wait briefly to see if user is doing 1, 2, or 3 taps
+    if (tapCount > 0 && (millis() - firstTapTime > DOUBLE_TAP_MS)) {
+        uint8_t finalTapCount = tapCount;
+        tapCount = 0;
+
+        if (finalTapCount == 1) {
+            handleSingleTap();
+        } else if (finalTapCount == 2) {
+            handleDoubleTap();
+        } else {
+            handleTripleTap();
         }
     }
 }
@@ -266,15 +398,37 @@ static void debugUpdate() {
     char cmd = Serial.read();
 
     switch (cmd) {
-        case 'A': triggerUVAlert(); break;
-        case 'B': notifyBLEConnected(); break;
+        case 'A':
+        case 'a':
+            triggerUVAlert();
+            break;
+
+        case 'B':
+        case 'b':
+            notifyBLEConnected();
+            break;
 
         case 'S':
+        case 's':
+            Serial.print("[DBG] systemState = ");
             Serial.println(getStateName(systemState));
+            Serial.print("[DBG] SED percent = ");
+            Serial.print(g_sedPercent, 1);
+            Serial.println("%");
+            break;
+
+        case 'M':
+        case 'm':
+            Serial.print("[DBG] motorState = ");
+            Serial.println(motorState == MOTOR_IDLE ? "IDLE" :
+                           motorState == MOTOR_PULSE_ON ? "PULSE_ON" : "PULSE_OFF");
             break;
 
         case '?':
-            Serial.println("A=alert B=ble S=state");
+            Serial.println("A=alert B=ble S=state M=motor");
+            break;
+
+        default:
             break;
     }
 }
