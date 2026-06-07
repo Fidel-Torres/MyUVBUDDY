@@ -1,3 +1,8 @@
+// EVENT-DRIVEN LOW-POWER TEST BUILD
+// - Sleep timer wakes MCU for UV sampling.
+// - Button GPIO interrupt wakes MCU for button gestures.
+// - BLE stack events wake MCU for dashboard connection/commands.
+// - MCU returns to sleep whenever no immediate work is pending.
 // =============================================================================
 // MyUVBuddy — System Integration Main Firmware
 // Hardware : Seeed Studio XIAO MG24 (EFR32MG24)
@@ -12,14 +17,16 @@
 #include <stdlib.h>
 #include "Adafruit_LTR390.h"
 #include "sl_sleeptimer.h"
+#include "sl_power_manager.h"
 #include "MotorButton.h"
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-#define RF_SW_PW_PIN PB5
-#define RF_SW_PIN    PB4
+#define RF_SW_PW_PIN     PB5
+#define RF_SW_PIN        PB4
+#define SLEEP_DEBUG_PIN  D0   // HIGH = active, LOW = sleeping
 
 static const uint8_t  DEVICE_NAME[]       = "MYUVBUDDY";
 static const uint32_t SAMPLE_INTERVAL_MS  = 5000u;
@@ -40,6 +47,7 @@ static const uint8_t THRESHOLD_DEBOUNCE   = 2u;
 // 1 SED = 100 J/m². The firmware estimates accumulated dose from UVI over time.
 // The default is Type I / sensitive profile, but the dashboard can update this
 // at runtime with the SETSED=x.x BLE command.
+static const float SED_DOSE_RATE_FACTOR = 0.025f;
 static const float DEFAULT_SED_ALERT_THRESHOLD = 2.0f;
 static float       g_sed_alert_threshold       = DEFAULT_SED_ALERT_THRESHOLD;
 
@@ -188,11 +196,14 @@ static void initializeSystem();
 static void initSerial();
 static void initMotorButton();
 static void initStatusLED();
+static void initSleepDebugPin();
 static void initAntennaSwitch();
 static void initSensor();
 static void logBleStackPending();
 
 static void serviceRuntimeTasks();
+static bool systemCanSleep();
+static void enterIdleSleep();
 static void handleButtonBleDisconnectRequest();
 static void handleSensorSampleEvent();
 static void processUvSample(uint32_t uvs, uint32_t als);
@@ -248,6 +259,7 @@ void loop()
 {
   serviceRuntimeTasks();
   handleSensorSampleEvent();
+  enterIdleSleep();
 }
 
 // =============================================================================
@@ -259,6 +271,7 @@ static void initializeSystem()
   initSerial();
   initMotorButton();
   initStatusLED();
+  initSleepDebugPin();
   initAntennaSwitch();
   initSensor();
   logBleStackPending();
@@ -280,6 +293,13 @@ static void initStatusLED()
 {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LED_BUILTIN_INACTIVE);
+}
+
+static void initSleepDebugPin()
+{
+  pinMode(SLEEP_DEBUG_PIN, OUTPUT);
+  digitalWrite(SLEEP_DEBUG_PIN, HIGH);  // Start HIGH — MCU is active
+  Serial.println("[DEBUG] Sleep debug pin D0 initialized (HIGH=active, LOW=sleep)");
 }
 
 static void initAntennaSwitch()
@@ -315,13 +335,14 @@ static void initSensor()
 static void logBleStackPending()
 {
   Serial.println("[BLE] Initializing (stack boot pending)...");
+  Serial.println("[POWER] Event-driven sleep enabled");
 }
 
 // =============================================================================
 // Runtime system services
-// Keeps non-blocking background tasks active during normal operation.
-// Low-power sleep is not enabled in this final integration build so BLE reconnect,
-// backlog replay, button input, haptic patterns, and Serial debugging stay reliable.
+// The loop services only pending event-driven work, then returns to sleep.
+// MotorButton uses a GPIO interrupt plus a sleep-timer service callback.
+// The sample timer, button interrupt, and BLE stack events wake the MCU.
 // =============================================================================
 
 static void serviceRuntimeTasks()
@@ -330,6 +351,41 @@ static void serviceRuntimeTasks()
 
   handleButtonBleDisconnectRequest();
   send_pending_readings();
+}
+
+// =============================================================================
+// Low-power sleep control
+// The MCU sleeps whenever no immediate firmware work is pending.
+// Future work such as haptic pulse changes and tap-window expiration is scheduled
+// by MotorButton's internal sleep timer, so the CPU does not need to stay awake.
+// D0 goes LOW just before sleeping and returns HIGH immediately on wakeup,
+// allowing voltage measurement to confirm sleep entry and exit.
+// =============================================================================
+
+static bool systemCanSleep()
+{
+  // Do not sleep while a timer-triggered sensor sample is waiting.
+  if (g_sensor_read_pending) return false;
+
+  // Do not sleep while the MotorButton module has immediate work to process.
+  if (motorHasPendingWork()) return false;
+
+  // Do not sleep while replaying stored readings to BLE.
+  // During replay, the firmware intentionally stays awake until the backlog clears.
+  if (g_ble_state == STATE_SPP_MODE && g_backlog_count > 0) return false;
+
+  return true;
+}
+
+static void enterIdleSleep()
+{
+  if (!systemCanSleep()) {
+    return;
+  }
+
+  digitalWrite(SLEEP_DEBUG_PIN, LOW);   // Signal: entering sleep
+  sl_power_manager_sleep();
+  digitalWrite(SLEEP_DEBUG_PIN, HIGH);  // Signal: woke up
 }
 
 static void handleButtonBleDisconnectRequest()
@@ -356,7 +412,6 @@ static void handleButtonBleDisconnectRequest()
 static void handleSensorSampleEvent()
 {
   if (!g_sensor_read_pending) {
-    delay(5);
     return;
   }
 
