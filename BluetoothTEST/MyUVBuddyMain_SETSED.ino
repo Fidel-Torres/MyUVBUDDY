@@ -9,7 +9,7 @@
 
 #include <Wire.h>
 #include <string.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include "Adafruit_LTR390.h"
 #include "sl_sleeptimer.h"
 #include "MotorButton.h"
@@ -38,8 +38,10 @@ static const uint8_t THRESHOLD_DEBOUNCE   = 2u;
 // Cumulative dose threshold.
 // SED = Standard Erythemal Dose.
 // 1 SED = 100 J/m². The firmware estimates accumulated dose from UVI over time.
-static const float SED_DOSE_RATE_FACTOR   = 0.025f;
+// The default is Type I / sensitive profile, but the dashboard can update this
+// at runtime with the SETSED=x.x BLE command.
 static const float DEFAULT_SED_ALERT_THRESHOLD = 2.0f;
+static float       g_sed_alert_threshold       = DEFAULT_SED_ALERT_THRESHOLD;
 
 // LTR390 conversion factors.
 static const uint32_t UV_SENSITIVITY      = 2300u;
@@ -56,20 +58,13 @@ static const uint32_t SIG_SED_HIGH        = (1u << 2);
 #define BACKLOG_SEND_SPACING_MS  50
 
 // Backlog filtering settings.
-#define DEFAULT_LOG_UVI_DELTA        0.2f
-#define DEFAULT_LOG_LUX_DELTA        10.0f
-#define DEFAULT_LOG_UV_RAW_DELTA     10u
-#define DEFAULT_LOG_SED_DELTA        0.005f
-#define DEFAULT_LOG_HEARTBEAT_MS     60000u
-
-// Runtime settings updated by BLE dashboard commands.
-// Defaults match the values used during integration testing.
-static float    g_sed_alert_threshold = DEFAULT_SED_ALERT_THRESHOLD;
-static float    g_log_uvi_delta       = DEFAULT_LOG_UVI_DELTA;
-static float    g_log_lux_delta       = DEFAULT_LOG_LUX_DELTA;
-static uint32_t g_log_uv_raw_delta    = DEFAULT_LOG_UV_RAW_DELTA;
-static float    g_log_sed_delta       = DEFAULT_LOG_SED_DELTA;
-static uint32_t g_log_heartbeat_ms    = DEFAULT_LOG_HEARTBEAT_MS;
+// These remain fixed in firmware because this version only lets the dashboard
+// configure the user's SED dose profile.
+#define LOG_UVI_DELTA        0.2f
+#define LOG_LUX_DELTA        10.0f
+#define LOG_UV_RAW_DELTA     10u
+#define LOG_SED_DELTA        0.005f
+#define LOG_HEARTBEAT_MS     60000u
 
 // =============================================================================
 // UUIDs
@@ -231,12 +226,8 @@ static void  accumulate_sed(float uvi);
 static void  check_uvi_threshold(float uvi);
 static void  check_sed_threshold();
 static void  reset_session();
+static void  apply_sed_threshold(float threshold);
 static void  handle_ble_command(const uint8_t* data, uint16_t len);
-static void  handle_config_command(const uint8_t* data, uint16_t len);
-static bool  readFloatParam(const char* cmd, const char* key, float& out);
-static bool  readUIntParam(const char* cmd, const char* key, uint32_t& out);
-static void  applyRuntimeConfig();
-static void  sendConfigAck();
 
 static bool  should_store_reading(float uvi, float lux, uint32_t uv_raw, float sed);
 static void  store_reading(float uvi, float lux, uint32_t uv_raw, float sed);
@@ -469,7 +460,7 @@ static bool should_store_reading(float uvi, float lux, uint32_t uv_raw, float se
   unsigned long now = millis();
 
   // Heartbeat: store at least one reading per minute even if values barely change.
-  if (now - g_last_stored_ms >= g_log_heartbeat_ms) {
+  if (now - g_last_stored_ms >= LOG_HEARTBEAT_MS) {
     return true;
   }
 
@@ -486,10 +477,10 @@ static bool should_store_reading(float uvi, float lux, uint32_t uv_raw, float se
   float dsed = sed - g_last_stored_sed;
   if (dsed < 0.0f) dsed = -dsed;
 
-  if (duvi >= g_log_uvi_delta) return true;
-  if (dlux >= g_log_lux_delta) return true;
-  if (duv_raw >= g_log_uv_raw_delta) return true;
-  if (dsed >= g_log_sed_delta) return true;
+  if (duvi >= LOG_UVI_DELTA) return true;
+  if (dlux >= LOG_LUX_DELTA) return true;
+  if (duv_raw >= LOG_UV_RAW_DELTA) return true;
+  if (dsed >= LOG_SED_DELTA) return true;
 
   return false;
 }
@@ -591,8 +582,8 @@ static void send_pending_readings()
 
 // =============================================================================
 // SED accumulation
-// Estimates cumulative UV dose over time. Each sample adds a small dose based
-// on the current UVI and the sampling interval.
+// Estimates cumulative UV dose over time.
+// Each sample adds a small dose based on UVI and the sampling interval.
 // =============================================================================
 
 static void accumulate_sed(float uvi)
@@ -605,8 +596,8 @@ static void accumulate_sed(float uvi)
 
 // =============================================================================
 // SED threshold check
-// Triggers a one-time alert when the cumulative session dose reaches the
-// selected dose profile limit sent from the dashboard.
+// Triggers a one-time alert when the cumulative daily/session dose reaches
+// the configured SED limit.
 // =============================================================================
 
 static void check_sed_threshold()
@@ -619,8 +610,8 @@ static void check_sed_threshold()
 
 // =============================================================================
 // Instant UVI threshold check with debounce
-// Requires multiple high readings before triggering an alert. This helps prevent
-// one noisy sensor sample from causing a false UV warning.
+// Requires multiple high readings before triggering an alert.
+// This prevents one noisy sensor sample from causing a false UV warning.
 // =============================================================================
 
 static void check_uvi_threshold(float uvi)
@@ -646,7 +637,7 @@ static void check_uvi_threshold(float uvi)
 
 // =============================================================================
 // Session reset
-// Clears cumulative exposure, alert states, haptic SED percentage, and backlog.
+// Clears cumulative exposure, alert states, SED percentage, and stored backlog.
 // Called when the dashboard sends the RESET command.
 // =============================================================================
 
@@ -666,15 +657,57 @@ static void reset_session()
 }
 
 // =============================================================================
+// Dose profile command
+// Updates the SED alert threshold from the dashboard.
+// The backlog filter remains fixed in firmware for stability.
+// =============================================================================
+
+static void apply_sed_threshold(float threshold)
+{
+  // Accept only reasonable dose limits to avoid accidental bad values.
+  if (threshold < 0.5f || threshold > 10.0f) {
+    const char* err = "ERR=BAD_SED\n";
+    ble_send_chunked((const uint8_t*)err, strlen(err));
+    return;
+  }
+
+  g_sed_alert_threshold = threshold;
+
+  // Recalculate haptic SED percentage using the new profile.
+  motorSetSedPercent((g_cumulative_sed / g_sed_alert_threshold) * 100.0f);
+
+  // Allow the new profile to trigger an alert if the current dose already exceeds it.
+  g_sed_alerted = false;
+  check_sed_threshold();
+
+  Serial.print("[CONFIG] SED threshold set to ");
+  Serial.print(g_sed_alert_threshold, 1);
+  Serial.println(" SED");
+
+  char ack[32];
+  snprintf(ack, sizeof(ack), "ACK=SED %.1f\n", g_sed_alert_threshold);
+  ble_send_chunked((const uint8_t*)ack, strlen(ack));
+}
+
+// =============================================================================
 // BLE command handler
 // Supported commands:
-// RESET  — resets cumulative SED and backlog
-// CONFIG — updates SED limit and backlog filter thresholds
+// RESET      — resets cumulative SED and backlog
+// SETSED=x.x — updates the SED alert threshold used by the MCU
 // =============================================================================
 
 static void handle_ble_command(const uint8_t* data, uint16_t len)
 {
-  if (len >= 5 && memcmp(data, "RESET", 5) == 0) {
+  char cmd[64];
+
+  if (len >= sizeof(cmd)) {
+    len = sizeof(cmd) - 1;
+  }
+
+  memcpy(cmd, data, len);
+  cmd[len] = '\0';
+
+  if (strncmp(cmd, "RESET", 5) == 0) {
     reset_session();
 
     const char* ack = "ACK=RESET\n";
@@ -682,144 +715,16 @@ static void handle_ble_command(const uint8_t* data, uint16_t len)
     return;
   }
 
-  if (len >= 6 && memcmp(data, "CONFIG", 6) == 0) {
-    handle_config_command(data, len);
+  if (strncmp(cmd, "SETSED=", 7) == 0) {
+    float threshold = atof(cmd + 7);
+    apply_sed_threshold(threshold);
     return;
   }
 }
 
 // =============================================================================
-// BLE configuration command
-// Dashboard command format:
-// CONFIG SED=2.0 FUVI=0.2 FLUX=10 FUV=10 FSED=0.005 HEART=60000
-// This lets the MCU, not just the website, own the dose threshold and backlog
-// filter behavior.
-// =============================================================================
-
-static void handle_config_command(const uint8_t* data, uint16_t len)
-{
-  char cmd[180];
-  uint16_t copy_len = (len < (sizeof(cmd) - 1)) ? len : (uint16_t)(sizeof(cmd) - 1);
-  memcpy(cmd, data, copy_len);
-  cmd[copy_len] = '\0';
-
-  float new_float = 0.0f;
-  uint32_t new_uint = 0;
-
-  if (readFloatParam(cmd, "SED=", new_float)) {
-    if (new_float >= 0.5f && new_float <= 10.0f) {
-      g_sed_alert_threshold = new_float;
-    }
-  }
-
-  if (readFloatParam(cmd, "FUVI=", new_float)) {
-    if (new_float >= 0.0f && new_float <= 5.0f) {
-      g_log_uvi_delta = new_float;
-    }
-  }
-
-  if (readFloatParam(cmd, "FLUX=", new_float)) {
-    if (new_float >= 0.0f && new_float <= 10000.0f) {
-      g_log_lux_delta = new_float;
-    }
-  }
-
-  if (readUIntParam(cmd, "FUV=", new_uint)) {
-    if (new_uint <= 100000u) {
-      g_log_uv_raw_delta = new_uint;
-    }
-  }
-
-  if (readFloatParam(cmd, "FSED=", new_float)) {
-    if (new_float >= 0.0f && new_float <= 1.0f) {
-      g_log_sed_delta = new_float;
-    }
-  }
-
-  if (readUIntParam(cmd, "HEART=", new_uint)) {
-    if (new_uint >= 5000u && new_uint <= 3600000u) {
-      g_log_heartbeat_ms = new_uint;
-    }
-  }
-
-  applyRuntimeConfig();
-  sendConfigAck();
-}
-
-static bool readFloatParam(const char* cmd, const char* key, float& out)
-{
-  const char* pos = strstr(cmd, key);
-  if (!pos) return false;
-
-  pos += strlen(key);
-  return sscanf(pos, "%f", &out) == 1;
-}
-
-static bool readUIntParam(const char* cmd, const char* key, uint32_t& out)
-{
-  const char* pos = strstr(cmd, key);
-  if (!pos) return false;
-
-  pos += strlen(key);
-  unsigned long temp = 0;
-  if (sscanf(pos, "%lu", &temp) != 1) return false;
-
-  out = (uint32_t)temp;
-  return true;
-}
-
-static void applyRuntimeConfig()
-{
-  // Make the next sample store under the new filter settings.
-  g_have_last_stored = false;
-
-  motorSetSedPercent((g_cumulative_sed / g_sed_alert_threshold) * 100.0f);
-
-  // If the user raises the SED limit after an alert, allow alerts again once
-  // the current dose is below the new threshold.
-  if (g_cumulative_sed < g_sed_alert_threshold) {
-    g_sed_alerted = false;
-  }
-
-  // If the user lowers the SED limit below the current dose, alert immediately.
-  if (!g_sed_alerted && g_cumulative_sed >= g_sed_alert_threshold) {
-    g_sed_alerted = true;
-    sl_bt_external_signal(SIG_SED_HIGH);
-  }
-
-  Serial.print("[CONFIG] SED limit = ");
-  Serial.print(g_sed_alert_threshold, 2);
-  Serial.print(" FUVI = ");
-  Serial.print(g_log_uvi_delta, 2);
-  Serial.print(" FLUX = ");
-  Serial.print(g_log_lux_delta, 1);
-  Serial.print(" FUV = ");
-  Serial.print(g_log_uv_raw_delta);
-  Serial.print(" FSED = ");
-  Serial.print(g_log_sed_delta, 3);
-  Serial.print(" HEART = ");
-  Serial.println(g_log_heartbeat_ms);
-}
-
-static void sendConfigAck()
-{
-  char ack[140];
-  snprintf(ack, sizeof(ack),
-    "ACK=CONFIG SED=%.2f FUVI=%.2f FLUX=%.1f FUV=%lu FSED=%.3f HEART=%lu\n",
-    g_sed_alert_threshold,
-    g_log_uvi_delta,
-    g_log_lux_delta,
-    (unsigned long)g_log_uv_raw_delta,
-    g_log_sed_delta,
-    (unsigned long)g_log_heartbeat_ms
-  );
-
-  ble_send_chunked((const uint8_t*)ack, strlen(ack));
-}
-
-// =============================================================================
 // Conversions
-// Converts raw LTR390 readings into dashboard-friendly UVI and lux estimates.
+// Converts raw LTR390 readings into user-facing UVI and lux estimates.
 // =============================================================================
 
 static float uvs_to_uvi(uint32_t uvs)
@@ -834,8 +739,9 @@ static float als_to_lux(uint32_t als)
 
 // =============================================================================
 // Sensor read with retry
-// Reads ambient light and UV data from the LTR390. The sensor is switched
-// between ALS and UVS modes, with retries for occasional missed updates.
+// Reads ambient light and UV data from the LTR390.
+// The sensor is switched between ALS and UVS modes, with short wait periods
+// for new data. Retries help recover from occasional missed sensor updates.
 // =============================================================================
 
 static bool sensor_read(uint32_t& out_uvs, uint32_t& out_als)
@@ -875,8 +781,8 @@ static bool sensor_read(uint32_t& out_uvs, uint32_t& out_als)
 
 // =============================================================================
 // Sleep-timer ISR
-// Timer callback kept intentionally short. It only sets a flag; the actual I2C
-// sensor read happens later in loop().
+// Timer callback kept intentionally short.
+// It only sets a flag; the actual I2C sensor read happens later in loop().
 // =============================================================================
 
 static void sample_timer_callback(sl_sleeptimer_timer_handle_t* /*handle*/,
@@ -955,8 +861,8 @@ static bool ble_send_chunked(const uint8_t* data, size_t len)
 // =============================================================================
 // BLE Stack Event Handler
 // Handles asynchronous BLE events from the Silicon Labs stack, including boot,
-// connection changes, notification enable/disable, received commands, MTU
-// updates, and firmware alert signals.
+// connection, disconnection, notification enable/disable, received commands,
+// MTU updates, and alert signals from the firmware.
 // =============================================================================
 
 void sl_bt_on_event(sl_bt_msg_t* evt)
@@ -1142,7 +1048,7 @@ static void ble_start_advertising()
 // GATT is the BLE data table exposed to the phone/browser.
 // It defines the services and characteristics the dashboard can access.
 // This project creates one custom SPP-like data characteristic for sending
-// sensor readings and receiving commands such as RESET.
+// sensor readings and receiving commands such as RESET and SETSED.
 // =============================================================================
 
 static void ble_init_gatt_db()
