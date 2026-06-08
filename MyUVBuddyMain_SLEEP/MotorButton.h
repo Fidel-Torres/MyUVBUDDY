@@ -73,5 +73,6 @@ void stopHaptic();
 
 void motorSetSedPercent(float percent);
 bool motorTakeBleDisconnectRequest();
+bool motorTakePairingRequest();
 
 #endif

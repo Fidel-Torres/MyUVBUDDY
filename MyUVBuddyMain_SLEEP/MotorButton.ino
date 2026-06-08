@@ -42,6 +42,7 @@ static float g_sedPercent = 0.0f;
 static bool g_bleConnected = false;
 static bool bleNotifyPending = false;
 static volatile bool g_bleDisconnectRequested = false;
+static volatile bool g_blePairingRequested = false;
 
 static uint8_t tapCount = 0;
 static unsigned long firstTapTime = 0;
@@ -326,6 +327,7 @@ static void handleLongPress()
         motorStart(PAT_BLE_CANCELLED);
         Serial.println("[BTN] BLE disconnect requested");
     } else {
+        g_blePairingRequested = true;   // ← new flag
         systemState = SYS_BLE_PAIRING;
         motorOff();
         motorStart(PAT_BLE_PAIRING);
@@ -424,6 +426,15 @@ bool motorTakeBleDisconnectRequest()
         return true;
     }
 
+    return false;
+}
+
+bool motorTakePairingRequest()
+{
+    if (g_blePairingRequested) {
+        g_blePairingRequested = false;
+        return true;
+    }
     return false;
 }
 

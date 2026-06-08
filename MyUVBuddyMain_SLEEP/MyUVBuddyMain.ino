@@ -1,16 +1,13 @@
 // EVENT-DRIVEN LOW-POWER TEST BUILD
-// - Sleep timer wakes MCU for UV sampling.
-// - Button GPIO interrupt wakes MCU for button gestures.
-// - BLE stack events wake MCU for dashboard connection/commands.
-// - MCU returns to sleep whenever no immediate work is pending.
+// MCU sleeps fully until button long-press triggers pairing mode.
+// On first BLE connect, dashboard sends SETTIME=<unix> to sync wall clock.
+// All stored readings use sleeptimer-based wall timestamps.
 // =============================================================================
 // MyUVBuddy — System Integration Main Firmware
 // Hardware : Seeed Studio XIAO MG24 (EFR32MG24)
 // Sensor   : Adafruit LTR390 UV / Ambient Light
 // Stack    : Tools > Protocol Stack > BLE (Silabs)
 // =============================================================================
-// IMPORTANT:
-// Manually select: Tools > Protocol Stack > BLE (Silabs)
 
 #include <Wire.h>
 #include <string.h>
@@ -37,35 +34,23 @@ static const uint16_t BLE_CONN_MAX_INT    = 800u;
 static const uint16_t BLE_CONN_LATENCY    = 0u;
 static const uint16_t BLE_CONN_TIMEOUT    = 600u;
 
-// Instant UV Index threshold.
 static const float   UVI_THRESHOLD        = 3.0f;
 static const uint8_t THRESHOLD_DEBOUNCE   = 2u;
 
-// Cumulative dose threshold.
-// SED = Standard Erythemal Dose.
-// 1 SED = 100 J/m². The firmware estimates accumulated dose from UVI over time.
-// The default is Type I / sensitive profile, but the dashboard can update this
-// at runtime with the SETSED=x.x BLE command.
 static const float DEFAULT_SED_ALERT_THRESHOLD = 2.0f;
 static float       g_sed_alert_threshold       = DEFAULT_SED_ALERT_THRESHOLD;
 
-// LTR390 conversion factors.
 static const uint32_t UV_SENSITIVITY      = 2300u;
 static const float    ALS_LUX_FACTOR      = 0.0083f;
+static const float    SED_DOSE_RATE_FACTOR = 0.025f;
 
-// External signal bitmasks.
 static const uint32_t SIG_UVI_HIGH        = (1u << 0);
 static const uint32_t SIG_UVI_OK          = (1u << 1);
 static const uint32_t SIG_SED_HIGH        = (1u << 2);
 
-// Backlog stores unsent readings while BLE is disconnected.
-// Filtering prevents repeated similar readings from filling the buffer.
 #define READ_BACKLOG_SIZE        300
 #define BACKLOG_SEND_SPACING_MS  50
 
-// Backlog filtering settings.
-// These remain fixed in firmware because this version only lets the dashboard
-// configure the user's SED dose profile.
 #define LOG_UVI_DELTA        0.2f
 #define LOG_LUX_DELTA        10.0f
 #define LOG_UV_RAW_DELTA     10u
@@ -74,8 +59,6 @@ static const uint32_t SIG_SED_HIGH        = (1u << 2);
 
 // =============================================================================
 // UUIDs
-// UUIDs uniquely identify the custom BLE service and data characteristic.
-// The web dashboard uses these same UUIDs to find the MyUVBuddy BLE data stream.
 // =============================================================================
 
 const uuid_128 SPP_SERVICE_UUID = {
@@ -102,19 +85,17 @@ const uuid_128 SPP_DATA_CHAR_UUID = {
 
 // =============================================================================
 // BLE state machine
-// Tracks the current BLE connection stage.
-// STATE_SPP_MODE means the dashboard enabled notifications, so the MCU can send
-// live readings and replay stored backlog data.
 // =============================================================================
 
 typedef enum {
-  STATE_DISCONNECTED = 0,
+  STATE_DORMANT = 0,   // ← new: sleeping, not advertising
+  STATE_DISCONNECTED,
   STATE_ADVERTISING,
   STATE_CONNECTED,
   STATE_SPP_MODE
 } spp_state_t;
 
-static volatile spp_state_t g_ble_state      = STATE_DISCONNECTED;
+static volatile spp_state_t g_ble_state      = STATE_DORMANT;
 static uint8_t              g_conn_handle     = SL_BT_INVALID_CONNECTION_HANDLE;
 static uint8_t              g_max_packet_size = 20u;
 
@@ -125,12 +106,35 @@ static uint16_t g_spp_service_handle;
 static uint16_t g_spp_data_char_handle;
 
 // =============================================================================
+// Wall clock (sleeptimer-based, survives sleep)
+// =============================================================================
+
+static bool     g_time_synced      = false;
+static uint32_t g_time_base_unix   = 0;
+static uint32_t g_time_base_ticks  = 0;
+
+static void apply_wall_time(uint32_t unix_ts)
+{
+  g_time_base_unix  = unix_ts;
+  g_time_base_ticks = sl_sleeptimer_get_tick_count();
+  g_time_synced     = true;
+  Serial.print("[TIME] Synced to unix: ");
+  Serial.println(unix_ts);
+}
+
+static uint32_t get_unix_time()
+{
+  if (!g_time_synced) return 0;
+  uint32_t delta_ticks = sl_sleeptimer_get_tick_count() - g_time_base_ticks;
+  uint32_t delta_s     = sl_sleeptimer_tick_to_ms(delta_ticks) / 1000u;
+  return g_time_base_unix + delta_s;
+}
+
+// =============================================================================
 // Sleep-timer and wakeup flag
 // =============================================================================
 
 static sl_sleeptimer_timer_handle_t g_sample_timer;
-
-// Set by the sample timer callback and handled later in loop().
 static volatile bool g_sensor_read_pending = false;
 
 // =============================================================================
@@ -156,38 +160,37 @@ static Adafruit_LTR390 g_ltr;
 static bool            g_sensor_ok = false;
 
 // =============================================================================
-// Local reading backlog for BLE disconnect/reconnect
+// Backlog — now stores unix timestamp per reading
 // =============================================================================
 
 typedef struct {
   uint32_t seq;
-  uint32_t ms;
-  float uvi;
-  float lux;
+  uint32_t unix_ts;   // wall time at capture (0 = unsynced)
+  bool     synced;    // was clock synced when this was captured?
+  float    uvi;
+  float    lux;
   uint32_t uv_raw;
-  float sed;
+  float    sed;
 } StoredReading;
 
 static StoredReading g_backlog[READ_BACKLOG_SIZE];
 
-static uint16_t g_backlog_head  = 0; // Next position to write a new reading.
-static uint16_t g_backlog_tail  = 0; // Oldest pending reading to send next.
-static uint16_t g_backlog_count = 0; // Number of readings waiting to be sent.
+static uint16_t g_backlog_head  = 0;
+static uint16_t g_backlog_tail  = 0;
+static uint16_t g_backlog_count = 0;
 
-static uint32_t g_sample_seq = 0;
+static uint32_t      g_sample_seq          = 0;
 static unsigned long g_last_backlog_send_ms = 0;
 
-// Last stored reading values for backlog filtering.
-static bool g_have_last_stored = false;
-
-static float g_last_stored_uvi = 0.0f;
-static float g_last_stored_lux = 0.0f;
-static uint32_t g_last_stored_uv_raw = 0;
-static float g_last_stored_sed = 0.0f;
-static unsigned long g_last_stored_ms = 0;
+static bool          g_have_last_stored  = false;
+static float         g_last_stored_uvi    = 0.0f;
+static float         g_last_stored_lux    = 0.0f;
+static uint32_t      g_last_stored_uv_raw = 0;
+static float         g_last_stored_sed    = 0.0f;
+static unsigned long g_last_stored_ms     = 0;
 
 // =============================================================================
-// Forward declarations — system-level structure
+// Forward declarations
 // =============================================================================
 
 static void initializeSystem();
@@ -196,28 +199,20 @@ static void initMotorButton();
 static void initStatusLED();
 static void initAntennaSwitch();
 static void initSensor();
-static void logBleStackPending();
 
 static void serviceRuntimeTasks();
 static bool systemCanSleep();
 static void enterIdleSleep();
 static void handleButtonBleDisconnectRequest();
+static void handleButtonPairingRequest();         // ← new
 static void handleSensorSampleEvent();
 static void processUvSample(uint32_t uvs, uint32_t als);
 static void handleSensorReadFailure();
 static void logSensorReading(float uvi, float lux, uint32_t uvs);
 
-// =============================================================================
-// Forward declarations — BLE
-// =============================================================================
-
 static void  ble_init_gatt_db();
 static void  ble_start_advertising();
 static bool  ble_send_chunked(const uint8_t* data, size_t len);
-
-// =============================================================================
-// Forward declarations — timer and sensor
-// =============================================================================
 
 static void  sample_timer_callback(sl_sleeptimer_timer_handle_t* handle, void* data);
 static void  start_sample_timer();
@@ -225,10 +220,6 @@ static void  start_sample_timer();
 static bool  sensor_read(uint32_t& out_uvs, uint32_t& out_als);
 static float uvs_to_uvi(uint32_t uvs);
 static float als_to_lux(uint32_t als);
-
-// =============================================================================
-// Forward declarations — processing and storage
-// =============================================================================
 
 static void  accumulate_sed(float uvi);
 static void  check_uvi_threshold(float uvi);
@@ -261,6 +252,8 @@ void loop()
 
 // =============================================================================
 // System initialization
+// Note: sensor timer and BLE advertising are NOT started here.
+// They start only after the user long-presses to enter pairing mode.
 // =============================================================================
 
 static void initializeSystem()
@@ -270,7 +263,9 @@ static void initializeSystem()
   initStatusLED();
   initAntennaSwitch();
   initSensor();
-  logBleStackPending();
+
+  Serial.println("[SYSTEM] Dormant — long-press button to start pairing");
+  Serial.println("[POWER] Event-driven sleep enabled");
 }
 
 static void initSerial()
@@ -296,8 +291,6 @@ static void initAntennaSwitch()
   pinMode(RF_SW_PW_PIN, OUTPUT);
   digitalWrite(RF_SW_PW_PIN, HIGH);
   delay(100);
-
-  // LOW = built-in antenna.
   pinMode(RF_SW_PIN, OUTPUT);
   digitalWrite(RF_SW_PIN, LOW);
 }
@@ -321,63 +314,63 @@ static void initSensor()
   Serial.println(g_sed_alert_threshold, 1);
 }
 
-static void logBleStackPending()
-{
-  Serial.println("[BLE] Initializing (stack boot pending)...");
-  Serial.println("[POWER] Event-driven sleep enabled");
-}
-
 // =============================================================================
-// Runtime system services
-// The loop services only pending event-driven work, then returns to sleep.
-// MotorButton uses a GPIO interrupt plus a sleep-timer service callback.
-// The sample timer, button interrupt, and BLE stack events wake the MCU.
+// Runtime service loop
 // =============================================================================
 
 static void serviceRuntimeTasks()
 {
   motorLoop();
-
+  handleButtonPairingRequest();     // ← check for pairing trigger first
   handleButtonBleDisconnectRequest();
   send_pending_readings();
 }
 
 // =============================================================================
-// Low-power sleep control
-// The MCU sleeps whenever no immediate firmware work is pending.
-// Future work such as haptic pulse changes and tap-window expiration is scheduled
-// by MotorButton's internal sleep timer, so the CPU does not need to stay awake.
+// Pairing gate
+// The MCU stays in STATE_DORMANT until handleButtonPairingRequest() fires.
+// On first trigger: init GATT, start advertising, start sample timer.
+// =============================================================================
+
+static void handleButtonPairingRequest()
+{
+  if (!motorTakePairingRequest()) return;
+
+  if (g_ble_state != STATE_DORMANT) {
+    // Already active — ignore
+    return;
+  }
+
+  Serial.println("[SYSTEM] Pairing requested — starting BLE + sensor timer");
+
+  ble_init_gatt_db();
+  ble_start_advertising();
+  start_sample_timer();
+
+  g_ble_state = STATE_ADVERTISING;
+}
+
+// =============================================================================
+// Sleep control
 // =============================================================================
 
 static bool systemCanSleep()
 {
-  // Do not sleep while a timer-triggered sensor sample is waiting.
-  if (g_sensor_read_pending) return false;
-
-  // Do not sleep while the MotorButton module has immediate work to process.
-  if (motorHasPendingWork()) return false;
-
-  // Do not sleep while replaying stored readings to BLE.
-  // During replay, the firmware intentionally stays awake until the backlog clears.
-  if (g_ble_state == STATE_SPP_MODE && g_backlog_count > 0) return false;
-
+  if (g_sensor_read_pending)                                       return false;
+  if (motorHasPendingWork())                                       return false;
+  if (g_ble_state == STATE_SPP_MODE && g_backlog_count > 0)       return false;
   return true;
 }
 
 static void enterIdleSleep()
 {
-  if (!systemCanSleep()) {
-    return;
-  }
-
+  if (!systemCanSleep()) return;
   sl_power_manager_sleep();
 }
 
 static void handleButtonBleDisconnectRequest()
 {
-  if (!motorTakeBleDisconnectRequest()) {
-    return;
-  }
+  if (!motorTakeBleDisconnectRequest()) return;
 
   if (g_conn_handle != SL_BT_INVALID_CONNECTION_HANDLE) {
     Serial.println("[BLE] Button requested disconnect");
@@ -388,24 +381,17 @@ static void handleButtonBleDisconnectRequest()
 }
 
 // =============================================================================
-// Sampling event handling
-// The sleep timer sets g_sensor_read_pending every sample interval.
-// The main loop handles the actual sensor read here so I2C work does not happen
-// inside the timer callback.
+// Sensor sample event
 // =============================================================================
 
 static void handleSensorSampleEvent()
 {
-  if (!g_sensor_read_pending) {
-    return;
-  }
-
+  if (!g_sensor_read_pending) return;
   g_sensor_read_pending = false;
 
   uint32_t uvs = 0;
   uint32_t als = 0;
 
-  // Sensor is read even when BLE is disconnected so exposure tracking continues.
   if (!sensor_read(uvs, als)) {
     handleSensorReadFailure();
     return;
@@ -417,7 +403,6 @@ static void handleSensorSampleEvent()
 static void handleSensorReadFailure()
 {
   Serial.println("[SENSOR] Read failed");
-
   if (g_ble_state == STATE_SPP_MODE) {
     const char* err = "ERR=SENSOR\n";
     ble_send_chunked((const uint8_t*)err, strlen(err));
@@ -430,11 +415,8 @@ static void processUvSample(uint32_t uvs, uint32_t als)
   float lux = als_to_lux(als);
 
   accumulate_sed(uvi);
-
-  // Update button/haptic module so triple tap reports current SED percentage.
   motorSetSedPercent((g_cumulative_sed / g_sed_alert_threshold) * 100.0f);
 
-  // Connected: keep live samples. Disconnected: save only important changes or heartbeat.
   if (should_store_reading(uvi, lux, uvs, g_cumulative_sed)) {
     store_reading(uvi, lux, uvs, g_cumulative_sed);
   } else {
@@ -442,11 +424,8 @@ static void processUvSample(uint32_t uvs, uint32_t als)
   }
 
   logSensorReading(uvi, lux, uvs);
-
   check_uvi_threshold(uvi);
   check_sed_threshold();
-
-  // If connected, send one pending reading now.
   send_pending_readings();
 }
 
@@ -464,13 +443,11 @@ static void logSensorReading(float uvi, float lux, uint32_t uvs)
 
 // =============================================================================
 // Service delay
-// Used during LTR390 integration waits so button/haptic logic does not freeze.
 // =============================================================================
 
 static void service_delay(uint32_t ms)
 {
   unsigned long start = millis();
-
   while (millis() - start < ms) {
     motorLoop();
     delay(1);
@@ -479,63 +456,38 @@ static void service_delay(uint32_t ms)
 
 // =============================================================================
 // Backlog filter
-// Decides whether the newest sensor sample should be saved to the RAM backlog.
-// While BLE notifications are active, every sample is kept so the dashboard
-// receives live data. While disconnected, only the first sample, periodic
-// heartbeat samples, or samples with significant UVI/LUX/UV/SED changes are saved.
 // =============================================================================
 
 static bool should_store_reading(float uvi, float lux, uint32_t uv_raw, float sed)
 {
-  // If BLE is connected and notifications are active, keep sending live samples.
-  if (g_ble_state == STATE_SPP_MODE) {
-    return true;
-  }
-
-  // Always store the first reading after startup/reset.
-  if (!g_have_last_stored) {
-    return true;
-  }
+  if (g_ble_state == STATE_SPP_MODE) return true;
+  if (!g_have_last_stored)           return true;
 
   unsigned long now = millis();
+  if (now - g_last_stored_ms >= LOG_HEARTBEAT_MS) return true;
 
-  // Heartbeat: store at least one reading per minute even if values barely change.
-  if (now - g_last_stored_ms >= LOG_HEARTBEAT_MS) {
-    return true;
-  }
+  float duvi = uvi - g_last_stored_uvi; if (duvi < 0) duvi = -duvi;
+  float dlux = lux - g_last_stored_lux; if (dlux < 0) dlux = -dlux;
+  uint32_t duv = (uv_raw > g_last_stored_uv_raw)
+                 ? (uv_raw - g_last_stored_uv_raw)
+                 : (g_last_stored_uv_raw - uv_raw);
+  float dsed = sed - g_last_stored_sed; if (dsed < 0) dsed = -dsed;
 
-  float duvi = uvi - g_last_stored_uvi;
-  if (duvi < 0.0f) duvi = -duvi;
-
-  float dlux = lux - g_last_stored_lux;
-  if (dlux < 0.0f) dlux = -dlux;
-
-  uint32_t duv_raw = (uv_raw > g_last_stored_uv_raw)
-                     ? (uv_raw - g_last_stored_uv_raw)
-                     : (g_last_stored_uv_raw - uv_raw);
-
-  float dsed = sed - g_last_stored_sed;
-  if (dsed < 0.0f) dsed = -dsed;
-
-  if (duvi >= LOG_UVI_DELTA) return true;
-  if (dlux >= LOG_LUX_DELTA) return true;
-  if (duv_raw >= LOG_UV_RAW_DELTA) return true;
-  if (dsed >= LOG_SED_DELTA) return true;
+  if (duvi   >= LOG_UVI_DELTA)    return true;
+  if (dlux   >= LOG_LUX_DELTA)    return true;
+  if (duv    >= LOG_UV_RAW_DELTA) return true;
+  if (dsed   >= LOG_SED_DELTA)    return true;
 
   return false;
 }
 
 // =============================================================================
-// Backlog storage
-// Stores unsent sensor readings in a circular RAM buffer while BLE is unavailable.
-// After the dashboard reconnects and enables notifications, pending readings are
-// sent one at a time so the BLE connection is not flooded.
+// Backlog storage — timestamps are wall time from sleeptimer clock
 // =============================================================================
 
 static void store_reading(float uvi, float lux, uint32_t uv_raw, float sed)
 {
   if (g_backlog_count == READ_BACKLOG_SIZE) {
-    // Buffer full: drop oldest unsent reading.
     g_backlog_tail = (g_backlog_tail + 1) % READ_BACKLOG_SIZE;
     g_backlog_count--;
     Serial.println("[LOG] Backlog full - oldest reading dropped");
@@ -543,102 +495,100 @@ static void store_reading(float uvi, float lux, uint32_t uv_raw, float sed)
 
   StoredReading& r = g_backlog[g_backlog_head];
 
-  r.seq    = g_sample_seq++;
-  r.ms     = millis();
-  r.uvi    = uvi;
-  r.lux    = lux;
-  r.uv_raw = uv_raw;
-  r.sed    = sed;
+  r.seq     = g_sample_seq++;
+  r.unix_ts = get_unix_time();       // ← wall time, survives sleep
+  r.synced  = g_time_synced;
+  r.uvi     = uvi;
+  r.lux     = lux;
+  r.uv_raw  = uv_raw;
+  r.sed     = sed;
 
   g_backlog_head = (g_backlog_head + 1) % READ_BACKLOG_SIZE;
   g_backlog_count++;
 
-  Serial.print("[LOG] Stored reading. Pending = ");
-  Serial.println(g_backlog_count);
+  Serial.print("[LOG] Stored seq=");
+  Serial.print(r.seq);
+  Serial.print(" unix=");
+  Serial.print(r.unix_ts);
+  Serial.print(" synced=");
+  Serial.println(r.synced ? "yes" : "no");
 
-  // Update filter reference values.
-  g_have_last_stored = true;
-  g_last_stored_uvi = uvi;
-  g_last_stored_lux = lux;
+  g_have_last_stored   = true;
+  g_last_stored_uvi    = uvi;
+  g_last_stored_lux    = lux;
   g_last_stored_uv_raw = uv_raw;
-  g_last_stored_sed = sed;
-  g_last_stored_ms = r.ms;
+  g_last_stored_sed    = sed;
+  g_last_stored_ms     = millis();
 }
 
 static void clear_backlog()
 {
-  g_backlog_head = 0;
-  g_backlog_tail = 0;
-  g_backlog_count = 0;
-  g_sample_seq = 0;
+  g_backlog_head       = 0;
+  g_backlog_tail       = 0;
+  g_backlog_count      = 0;
+  g_sample_seq         = 0;
   g_last_backlog_send_ms = 0;
-
-  g_have_last_stored = false;
-  g_last_stored_uvi = 0.0f;
-  g_last_stored_lux = 0.0f;
+  g_have_last_stored   = false;
+  g_last_stored_uvi    = 0.0f;
+  g_last_stored_lux    = 0.0f;
   g_last_stored_uv_raw = 0;
-  g_last_stored_sed = 0.0f;
-  g_last_stored_ms = 0;
-
+  g_last_stored_sed    = 0.0f;
+  g_last_stored_ms     = 0;
   Serial.println("[LOG] Backlog cleared");
 }
+
+// =============================================================================
+// Send pending readings
+// Packet format: SEQ=n T=unix UVI=x.x LUX=x.x UV=n SED=x.xxx SYNCED=1\n
+// Dashboard uses T= for display time. SYNCED=0 means clock wasn't set yet.
+// =============================================================================
 
 static void send_pending_readings()
 {
   if (g_ble_state != STATE_SPP_MODE) return;
-  if (g_backlog_count == 0) return;
+  if (g_backlog_count == 0)          return;
 
   unsigned long now = millis();
-
-  // Do not flood GATT notifications.
   if (now - g_last_backlog_send_ms < BACKLOG_SEND_SPACING_MS) return;
 
   StoredReading& r = g_backlog[g_backlog_tail];
 
-  char msg[96];
+  char msg[120];
   int len = snprintf(msg, sizeof(msg),
-    "SEQ=%lu T=%lu UVI=%.1f LUX=%.1f UV=%lu SED=%.3f\n",
+    "SEQ=%lu T=%lu UVI=%.1f LUX=%.1f UV=%lu SED=%.3f SYNCED=%d\n",
     r.seq,
-    r.ms,
+    r.unix_ts,
     r.uvi,
     r.lux,
     r.uv_raw,
-    r.sed
+    r.sed,
+    r.synced ? 1 : 0
   );
 
   if (len <= 0) return;
 
-  bool sent_ok = ble_send_chunked((const uint8_t*)msg, (size_t)len);
-
-  if (sent_ok) {
+  if (ble_send_chunked((const uint8_t*)msg, (size_t)len)) {
     g_backlog_tail = (g_backlog_tail + 1) % READ_BACKLOG_SIZE;
     g_backlog_count--;
     g_last_backlog_send_ms = now;
 
-    Serial.print("[BLE LOG] Sent stored reading. Remaining = ");
+    Serial.print("[BLE LOG] Sent seq=");
+    Serial.print(r.seq);
+    Serial.print(" remaining=");
     Serial.println(g_backlog_count);
   }
 }
 
 // =============================================================================
 // SED accumulation
-// Estimates cumulative UV dose over time.
-// Each sample adds a small dose based on UVI and the sampling interval.
 // =============================================================================
 
 static void accumulate_sed(float uvi)
 {
   if (uvi < 0.0f) return;
-
   g_cumulative_J   += uvi * SED_DOSE_RATE_FACTOR * SAMPLE_INTERVAL_S;
   g_cumulative_sed  = g_cumulative_J / 100.0f;
 }
-
-// =============================================================================
-// SED threshold check
-// Triggers a one-time alert when the cumulative daily/session dose reaches
-// the configured SED limit.
-// =============================================================================
 
 static void check_sed_threshold()
 {
@@ -648,18 +598,11 @@ static void check_sed_threshold()
   }
 }
 
-// =============================================================================
-// Instant UVI threshold check with debounce
-// Requires multiple high readings before triggering an alert.
-// This prevents one noisy sensor sample from causing a false UV warning.
-// =============================================================================
-
 static void check_uvi_threshold(float uvi)
 {
   if (uvi >= UVI_THRESHOLD) {
     if (!g_above_threshold) {
       g_threshold_hit_count++;
-
       if (g_threshold_hit_count >= THRESHOLD_DEBOUNCE) {
         g_above_threshold = true;
         sl_bt_external_signal(SIG_UVI_HIGH);
@@ -667,7 +610,6 @@ static void check_uvi_threshold(float uvi)
     }
   } else {
     g_threshold_hit_count = 0u;
-
     if (g_above_threshold) {
       g_above_threshold = false;
       sl_bt_external_signal(SIG_UVI_OK);
@@ -677,34 +619,26 @@ static void check_uvi_threshold(float uvi)
 
 // =============================================================================
 // Session reset
-// Clears cumulative exposure, alert states, SED percentage, and stored backlog.
-// Called when the dashboard sends the RESET command.
 // =============================================================================
 
 static void reset_session()
 {
-  g_cumulative_J    = 0.0f;
-  g_cumulative_sed  = 0.0f;
-  g_sed_alerted     = false;
-  g_above_threshold = false;
+  g_cumulative_J        = 0.0f;
+  g_cumulative_sed      = 0.0f;
+  g_sed_alerted         = false;
+  g_above_threshold     = false;
   g_threshold_hit_count = 0u;
-
   motorSetSedPercent(0.0f);
-
   clear_backlog();
-
   Serial.println("[SESSION] Reset — cumulative SED cleared");
 }
 
 // =============================================================================
 // Dose profile command
-// Updates the SED alert threshold from the dashboard.
-// The backlog filter remains fixed in firmware for stability.
 // =============================================================================
 
 static void apply_sed_threshold(float threshold)
 {
-  // Accept only reasonable dose limits to avoid accidental bad values.
   if (threshold < 0.5f || threshold > 10.0f) {
     const char* err = "ERR=BAD_SED\n";
     ble_send_chunked((const uint8_t*)err, strlen(err));
@@ -712,17 +646,12 @@ static void apply_sed_threshold(float threshold)
   }
 
   g_sed_alert_threshold = threshold;
-
-  // Recalculate haptic SED percentage using the new profile.
   motorSetSedPercent((g_cumulative_sed / g_sed_alert_threshold) * 100.0f);
-
-  // Allow the new profile to trigger an alert if the current dose already exceeds it.
   g_sed_alerted = false;
   check_sed_threshold();
 
-  Serial.print("[CONFIG] SED threshold set to ");
-  Serial.print(g_sed_alert_threshold, 1);
-  Serial.println(" SED");
+  Serial.print("[CONFIG] SED threshold: ");
+  Serial.println(g_sed_alert_threshold, 1);
 
   char ack[32];
   snprintf(ack, sizeof(ack), "ACK=SED %.1f\n", g_sed_alert_threshold);
@@ -731,57 +660,47 @@ static void apply_sed_threshold(float threshold)
 
 // =============================================================================
 // BLE command handler
-// Supported commands:
-// RESET      — resets cumulative SED and backlog
-// SETSED=x.x — updates the SED alert threshold used by the MCU
+// Commands: RESET | SETSED=x.x | SETTIME=unix
 // =============================================================================
 
 static void handle_ble_command(const uint8_t* data, uint16_t len)
 {
   char cmd[64];
-
-  if (len >= sizeof(cmd)) {
-    len = sizeof(cmd) - 1;
-  }
-
+  if (len >= sizeof(cmd)) len = sizeof(cmd) - 1;
   memcpy(cmd, data, len);
   cmd[len] = '\0';
 
   if (strncmp(cmd, "RESET", 5) == 0) {
     reset_session();
-
     const char* ack = "ACK=RESET\n";
     ble_send_chunked((const uint8_t*)ack, strlen(ack));
     return;
   }
 
   if (strncmp(cmd, "SETSED=", 7) == 0) {
-    float threshold = atof(cmd + 7);
-    apply_sed_threshold(threshold);
+    apply_sed_threshold(atof(cmd + 7));
+    return;
+  }
+
+  // Wall clock sync from dashboard
+  if (strncmp(cmd, "SETTIME=", 8) == 0) {
+    uint32_t unix_ts = (uint32_t)atol(cmd + 8);
+    apply_wall_time(unix_ts);
+    const char* ack = "ACK=TIME\n";
+    ble_send_chunked((const uint8_t*)ack, strlen(ack));
     return;
   }
 }
 
 // =============================================================================
 // Conversions
-// Converts raw LTR390 readings into user-facing UVI and lux estimates.
 // =============================================================================
 
-static float uvs_to_uvi(uint32_t uvs)
-{
-  return (float)uvs / (float)UV_SENSITIVITY;
-}
-
-static float als_to_lux(uint32_t als)
-{
-  return (float)als * ALS_LUX_FACTOR;
-}
+static float uvs_to_uvi(uint32_t uvs) { return (float)uvs / (float)UV_SENSITIVITY; }
+static float als_to_lux(uint32_t als) { return (float)als * ALS_LUX_FACTOR; }
 
 // =============================================================================
 // Sensor read with retry
-// Reads ambient light and UV data from the LTR390.
-// The sensor is switched between ALS and UVS modes, with short wait periods
-// for new data. Retries help recover from occasional missed sensor updates.
 // =============================================================================
 
 static bool sensor_read(uint32_t& out_uvs, uint32_t& out_als)
@@ -789,28 +708,17 @@ static bool sensor_read(uint32_t& out_uvs, uint32_t& out_als)
   if (!g_sensor_ok) return false;
 
   for (uint8_t attempt = 0; attempt < SENSOR_RETRY_LIMIT; attempt++) {
-
     g_ltr.setMode(LTR390_MODE_ALS);
     service_delay(420);
-
-    if (!g_ltr.newDataAvailable()) {
-      service_delay(80);
-    }
-
+    if (!g_ltr.newDataAvailable()) service_delay(80);
     out_als = g_ltr.readALS();
 
     g_ltr.setMode(LTR390_MODE_UVS);
     service_delay(420);
-
-    if (!g_ltr.newDataAvailable()) {
-      service_delay(80);
-    }
-
+    if (!g_ltr.newDataAvailable()) service_delay(80);
     out_uvs = g_ltr.readUVS();
 
-    if (out_als != 0xFFFFFFFF && out_uvs != 0xFFFFFFFF) {
-      return true;
-    }
+    if (out_als != 0xFFFFFFFF && out_uvs != 0xFFFFFFFF) return true;
 
     Serial.print("[SENSOR] Retry ");
     Serial.println(attempt + 1);
@@ -821,8 +729,6 @@ static bool sensor_read(uint32_t& out_uvs, uint32_t& out_als)
 
 // =============================================================================
 // Sleep-timer ISR
-// Timer callback kept intentionally short.
-// It only sets a flag; the actual I2C sensor read happens later in loop().
 // =============================================================================
 
 static void sample_timer_callback(sl_sleeptimer_timer_handle_t* /*handle*/,
@@ -830,11 +736,6 @@ static void sample_timer_callback(sl_sleeptimer_timer_handle_t* /*handle*/,
 {
   g_sensor_read_pending = true;
 }
-
-// =============================================================================
-// Start periodic sample timer
-// Configures the timer that schedules UV samples every SAMPLE_INTERVAL_MS.
-// =============================================================================
 
 static void start_sample_timer()
 {
@@ -860,9 +761,7 @@ static void start_sample_timer()
 }
 
 // =============================================================================
-// Send data chunked to BLE MTU
-// BLE notifications have a maximum packet size, so longer messages are split
-// into smaller chunks before being sent to the dashboard.
+// BLE send chunked
 // =============================================================================
 
 static bool ble_send_chunked(const uint8_t* data, size_t len)
@@ -870,7 +769,6 @@ static bool ble_send_chunked(const uint8_t* data, size_t len)
   if (g_ble_state != STATE_SPP_MODE) return false;
 
   size_t offset = 0;
-
   while (offset < len) {
     size_t chunk = min((size_t)g_max_packet_size, len - offset);
 
@@ -888,11 +786,7 @@ static bool ble_send_chunked(const uint8_t* data, size_t len)
     }
 
     offset += chunk;
-
-    // Small spacing between chunks helps avoid GATT flooding.
-    if (offset < len) {
-      delay(2);
-    }
+    if (offset < len) delay(2);
   }
 
   return true;
@@ -900,9 +794,6 @@ static bool ble_send_chunked(const uint8_t* data, size_t len)
 
 // =============================================================================
 // BLE Stack Event Handler
-// Handles asynchronous BLE events from the Silicon Labs stack, including boot,
-// connection, disconnection, notification enable/disable, received commands,
-// MTU updates, and alert signals from the firmware.
 // =============================================================================
 
 void sl_bt_on_event(sl_bt_msg_t* evt)
@@ -910,29 +801,21 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
   switch (SL_BT_MSG_ID(evt->header)) {
 
     case sl_bt_evt_system_boot_id:
-      Serial.println("[BLE] Stack booted");
-
-      ble_init_gatt_db();
-      ble_start_advertising();
-      start_sample_timer();
-
-      g_ble_state = STATE_ADVERTISING;
+      Serial.println("[BLE] Stack booted — waiting for button pairing trigger");
+      // Do NOT advertise or start timer here. Wait for button long-press.
+      ble_init_gatt_db();   // GATT DB must be built at boot
       break;
 
     case sl_bt_evt_connection_opened_id:
       Serial.println("[BLE] Connected");
-
       g_ble_state   = STATE_CONNECTED;
       g_conn_handle = evt->data.evt_connection_opened.connection;
 
       sl_bt_connection_set_parameters(
         g_conn_handle,
-        BLE_CONN_MIN_INT,
-        BLE_CONN_MAX_INT,
-        BLE_CONN_LATENCY,
-        BLE_CONN_TIMEOUT,
-        0,
-        0xFFFF
+        BLE_CONN_MIN_INT, BLE_CONN_MAX_INT,
+        BLE_CONN_LATENCY, BLE_CONN_TIMEOUT,
+        0, 0xFFFF
       );
       break;
 
@@ -940,21 +823,16 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
       Serial.print("[BLE] Disconnected, reason: 0x");
       Serial.println(evt->data.evt_connection_closed.reason, HEX);
 
-      // Safety cleanup: force haptic off if BLE disconnects.
       stopHaptic();
-
       g_ble_state   = STATE_ADVERTISING;
       g_conn_handle = SL_BT_INVALID_CONNECTION_HANDLE;
-
       digitalWrite(LED_BUILTIN, LED_BUILTIN_INACTIVE);
-
       ble_start_advertising();
       break;
 
     case sl_bt_evt_gatt_mtu_exchanged_id:
       g_max_packet_size =
         (uint8_t)(evt->data.evt_gatt_mtu_exchanged.mtu - 3u);
-
       Serial.print("[BLE] MTU: ");
       Serial.println(g_max_packet_size + 3);
       break;
@@ -962,7 +840,6 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
     case sl_bt_evt_gatt_server_attribute_value_id:
     {
       auto& av = evt->data.evt_gatt_server_attribute_value;
-
       if (av.attribute == g_spp_data_char_handle) {
         handle_ble_command(av.value.data, av.value.len);
       }
@@ -972,26 +849,23 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
     case sl_bt_evt_gatt_server_characteristic_status_id:
     {
       auto& cs = evt->data.evt_gatt_server_characteristic_status;
-
       if (cs.characteristic == g_spp_data_char_handle) {
-
         if (cs.client_config_flags == sl_bt_gatt_server_notification) {
           g_ble_state = STATE_SPP_MODE;
-
           digitalWrite(LED_BUILTIN, LED_BUILTIN_ACTIVE);
-
           Serial.println("[BLE] Notifications enabled — SPP mode active");
+
+          // Request time sync from dashboard immediately
+          const char* req = "CMD=REQTIME\n";
+          ble_send_chunked((const uint8_t*)req, strlen(req));
 
           notifyBLEConnected();
 
           Serial.print("[BLE] Backlog pending = ");
           Serial.println(g_backlog_count);
-
         } else {
           g_ble_state = STATE_CONNECTED;
-
           digitalWrite(LED_BUILTIN, LED_BUILTIN_INACTIVE);
-
           Serial.println("[BLE] Notifications disabled");
         }
       }
@@ -1004,32 +878,24 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
 
       if (signals & SIG_UVI_HIGH) {
         Serial.println("[ALERT] UVI above threshold");
-
         const char* alert = "ALERT=UVI_HIGH\n";
         ble_send_chunked((const uint8_t*)alert, strlen(alert));
-
         digitalWrite(LED_BUILTIN, LED_BUILTIN_ACTIVE);
-
         triggerUVAlert();
       }
 
       if (signals & SIG_UVI_OK) {
         Serial.println("[ALERT] UVI back below threshold");
-
         const char* alert = "ALERT=UVI_OK\n";
         ble_send_chunked((const uint8_t*)alert, strlen(alert));
-
         digitalWrite(LED_BUILTIN, LED_BUILTIN_INACTIVE);
       }
 
       if (signals & SIG_SED_HIGH) {
-        Serial.print("[ALERT] Cumulative SED threshold reached: ");
-        Serial.print(g_cumulative_sed, 3);
-        Serial.println(" SED");
-
+        Serial.print("[ALERT] SED threshold reached: ");
+        Serial.println(g_cumulative_sed, 3);
         const char* alert = "ALERT=SED_HIGH\n";
         ble_send_chunked((const uint8_t*)alert, strlen(alert));
-
         triggerUVAlert();
       }
     }
@@ -1038,7 +904,6 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
     case sl_bt_evt_connection_parameters_id:
     {
       auto& p = evt->data.evt_connection_parameters;
-
       Serial.print("[BLE] Conn params — interval: ");
       Serial.print(p.interval);
       Serial.print(" latency: ");
@@ -1055,8 +920,6 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
 
 // =============================================================================
 // Advertising
-// Starts BLE advertising so the phone/browser dashboard can discover and
-// connect to the MyUVBuddy device.
 // =============================================================================
 
 static void ble_start_advertising()
@@ -1085,10 +948,6 @@ static void ble_start_advertising()
 
 // =============================================================================
 // GATT Database
-// GATT is the BLE data table exposed to the phone/browser.
-// It defines the services and characteristics the dashboard can access.
-// This project creates one custom SPP-like data characteristic for sending
-// sensor readings and receiving commands such as RESET and SETSED.
 // =============================================================================
 
 static void ble_init_gatt_db()
@@ -1112,8 +971,7 @@ static void ble_init_gatt_db()
     g_gattdb_session,
     g_ga_service_handle,
     SL_BT_GATTDB_CHARACTERISTIC_READ,
-    0x00,
-    0x00,
+    0x00, 0x00,
     dev_name_uuid,
     sl_bt_gattdb_fixed_length_value,
     sizeof(DEVICE_NAME) - 1,
@@ -1140,8 +998,7 @@ static void ble_init_gatt_db()
     g_spp_service_handle,
     SL_BT_GATTDB_CHARACTERISTIC_WRITE_NO_RESPONSE |
     SL_BT_GATTDB_CHARACTERISTIC_NOTIFY,
-    0x00,
-    0x00,
+    0x00, 0x00,
     SPP_DATA_CHAR_UUID,
     sl_bt_gattdb_fixed_length_value,
     250,
@@ -1151,7 +1008,6 @@ static void ble_init_gatt_db()
   );
 
   sl_bt_gattdb_start_service(g_gattdb_session, g_spp_service_handle);
-
   sl_bt_gattdb_commit(g_gattdb_session);
 
   Serial.println("[BLE] GATT DB initialized");

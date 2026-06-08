@@ -212,6 +212,7 @@ let characteristic  = null;
 let connected       = false;
 let history         = JSON.parse(localStorage.getItem('uvbuddy_history') || '[]');
 let sessionStart    = null;
+let bleBuffer       = '';
 
 let sedThreshold    = 2.0;
 let sedTypeName     = 'I';
@@ -347,6 +348,12 @@ function updateSedBar(sed) {
 // -----------------------------------------------------------------------------
 
 function parseMsg(raw) {
+  if (raw.includes('CMD=REQTIME')) {
+    const nowUnix = Math.floor(Date.now() / 1000);
+    sendCommand(`SETTIME=${nowUnix}\n`);
+    return null;
+  }
+
   if (raw.includes('ALERT=')) {
     if (raw.includes('ALERT=UVI_HIGH')) setAlert(true,  'UVI above threshold - seek shade');
     if (raw.includes('ALERT=UVI_OK'))   setAlert(false, '');
@@ -354,46 +361,40 @@ function parseMsg(raw) {
     return null;
   }
 
-  if (raw.includes('ACK=RESET')) {
-    setStatus('live', 'Session reset confirmed by device');
-    return null;
-  }
+  if (raw.includes('ACK=RESET')) { setStatus('live', 'Session reset confirmed by device'); return null; }
+  if (raw.includes('ACK=TIME'))  { setStatus('live', 'Clock synced with device');           return null; }
+  if (raw.includes('ACK=SED'))   { setStatus('live', 'Dose profile confirmed by device');   return null; }
+  if (raw.includes('ERR=BAD_SED')) { setStatus('live', 'Rejected: invalid SED limit');      return null; }
+  if (raw.includes('ERR='))        { setStatus('live', 'Sensor error from device');          return null; }
 
-  if (raw.includes('ACK=SED')) {
-    setStatus('live', 'Dose profile confirmed by device');
-    return null;
-  }
-
-  if (raw.includes('ERR=BAD_SED')) {
-    setStatus('live', 'Rejected dose profile: invalid SED limit');
-    return null;
-  }
-
-  if (raw.includes('ERR=')) {
-    setStatus('live', 'Sensor error received from device');
-    return null;
-  }
-
-  const uviMatch = raw.match(/UVI=([\d.]+)/);
-  const luxMatch = raw.match(/LUX=([\d.]+)/);
-  const sedMatch = raw.match(/SED=([\d.]+)/);
+  const uviMatch    = raw.match(/UVI=([\d.]+)/);
+  const luxMatch    = raw.match(/LUX=([\d.]+)/);
+  const sedMatch    = raw.match(/SED=([\d.]+)/);
+  const tMatch      = raw.match(/T=(\d+)/);
+  const syncedMatch = raw.match(/SYNCED=(\d)/);
 
   if (!uviMatch || !luxMatch || !sedMatch) return null;
 
   return {
-    uvi: parseFloat(uviMatch[1]),
-    lux: parseFloat(luxMatch[1]),
-    sed: parseFloat(sedMatch[1])
+    uvi:     parseFloat(uviMatch[1]),
+    lux:     parseFloat(luxMatch[1]),
+    sed:     parseFloat(sedMatch[1]),
+    unix_ts: tMatch      ? parseInt(tMatch[1])      : 0,
+    synced:  syncedMatch ? syncedMatch[1] === '1'    : false
   };
 }
-
 // -----------------------------------------------------------------------------
 // Data handling
 // -----------------------------------------------------------------------------
 
 function addReading(parsed) {
-  const now   = new Date();
-  const entry = { ts: now.toISOString(), uvi: parsed.uvi, lux: parsed.lux, sed: parsed.sed };
+  const now = new Date();
+
+  const ts = (parsed.unix_ts && parsed.synced)
+    ? new Date(parsed.unix_ts * 1000).toISOString()
+    : now.toISOString();
+
+  const entry = { ts, uvi: parsed.uvi, lux: parsed.lux, sed: parsed.sed };
 
   history.unshift(entry);
   if (history.length > 500) history.pop();
@@ -499,6 +500,7 @@ async function resetSession() {
 
 async function toggleConnect() {
   if (connected) {
+    bleBuffer      = '';
     if (characteristic) {
       try { await characteristic.stopNotifications(); } catch(e) {}
     }
@@ -539,12 +541,26 @@ async function toggleConnect() {
 
     await characteristic.startNotifications();
     characteristic.addEventListener('characteristicvaluechanged', e => {
-      const raw    = new TextDecoder().decode(e.target.value);
-      const parsed = parseMsg(raw);
-      if (parsed) addReading(parsed);
+      bleBuffer += new TextDecoder().decode(e.target.value);
+
+      let newlineIdx;
+      while ((newlineIdx = bleBuffer.indexOf('\n')) !== -1) {
+        const line = bleBuffer.slice(0, newlineIdx).trim();
+        bleBuffer  = bleBuffer.slice(newlineIdx + 1);
+
+        if (!line) continue;
+
+        const parsed = parseMsg(line);
+        if (parsed) addReading(parsed);
+      }
     });
 
+    // Send current unix time so MCU can stamp readings correctly
+    const nowUnix = Math.floor(Date.now() / 1000);
+    await sendCommand(`SETTIME=${nowUnix}\n`);
+    
     device.addEventListener('gattserverdisconnected', () => {
+      bleBuffer      = '';
       characteristic = null;
       connected = false;
       setStatus('off', 'Device disconnected');
