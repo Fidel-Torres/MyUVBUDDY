@@ -128,12 +128,11 @@ static void scheduleNextMotorService()
         scheduled = true;
     }
 
-    // Tap classification window.
     if (tapCount > 0) {
         unsigned long elapsed = now - firstTapTime;
-        unsigned long remaining = (elapsed > DOUBLE_TAP_MS)
-                                  ? 1UL
-                                  : (DOUBLE_TAP_MS - elapsed + 1UL);
+        unsigned long remaining = (elapsed > TRIPLE_TAP_MS)
+                                ? 1UL
+                                : (TRIPLE_TAP_MS - elapsed + 1UL);
         nextDelay = min(nextDelay, remaining);
         scheduled = true;
     }
@@ -517,17 +516,16 @@ void motorLoop()
         }
     }
 
-    // Classify 1, 2, or 3 taps after the tap window expires.
-    if (tapCount > 0 && (millis() - firstTapTime > DOUBLE_TAP_MS)) {
+    if (tapCount > 0 && (millis() - firstTapTime > TRIPLE_TAP_MS)) {
         uint8_t finalTapCount = tapCount;
         tapCount = 0;
 
-        if (finalTapCount == 1) {
-            handleSingleTap();
+        if (finalTapCount >= 3) {
+            handleTripleTap();
         } else if (finalTapCount == 2) {
             handleDoubleTap();
         } else {
-            handleTripleTap();
+            handleSingleTap();
         }
     }
 
@@ -557,6 +555,7 @@ static void debugUpdate()
     char cmd = Serial.read();
 
     switch (cmd) {
+
         case 'A':
         case 'a':
             triggerUVAlert();
@@ -571,6 +570,7 @@ static void debugUpdate()
         case 's':
             Serial.print("[DBG] systemState = ");
             Serial.println(getStateName(systemState));
+
             Serial.print("[DBG] SED percent = ");
             Serial.print(g_sedPercent, 1);
             Serial.println("%");
@@ -579,12 +579,41 @@ static void debugUpdate()
         case 'M':
         case 'm':
             Serial.print("[DBG] motorState = ");
-            Serial.println(motorState == MOTOR_IDLE ? "IDLE" :
-                           motorState == MOTOR_PULSE_ON ? "PULSE_ON" : "PULSE_OFF");
+            Serial.println(
+                motorState == MOTOR_IDLE     ? "IDLE" :
+                motorState == MOTOR_PULSE_ON ? "PULSE_ON" :
+                                               "PULSE_OFF"
+            );
             break;
 
+        case 'P':
+        case 'p':
+        {
+            float value = Serial.parseFloat();
+
+            motorSetSedPercent(value);
+
+            Serial.print("[DBG] SED set to ");
+            Serial.print(value, 1);
+            Serial.println("%");
+
+            playSedPercentPattern();
+            break;
+        }
+
         case '?':
-            Serial.println("A=alert B=ble S=state M=motor");
+            Serial.println("Commands:");
+            Serial.println("  A      = Trigger UV alert");
+            Serial.println("  B      = Simulate BLE connected");
+            Serial.println("  S      = Show system state");
+            Serial.println("  M      = Show motor state");
+            Serial.println("  P<num> = Test SED vibration");
+            Serial.println("Examples:");
+            Serial.println("  P10");
+            Serial.println("  P50");
+            Serial.println("  P75");
+            Serial.println("  P100");
+            Serial.println("  P125");
             break;
 
         default:

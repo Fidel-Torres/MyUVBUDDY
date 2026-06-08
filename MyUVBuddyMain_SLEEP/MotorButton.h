@@ -22,14 +22,15 @@
 #define DEBOUNCE_MS    50
 #define LONG_PRESS_MS  2000
 #define DOUBLE_TAP_MS  400
+#define TRIPLE_TAP_MS  600
 #define SNOOZE_MS      30000
 
 // ─────────────────────────────────────────────
 // PWM LEVELS
 // ─────────────────────────────────────────────
 #define PWM_OFF   0
-#define PWM_LOW   100
-#define PWM_MED   180
+#define PWM_LOW   150
+#define PWM_MED   200
 #define PWM_HIGH  230
 #define PWM_MAX   255
 
