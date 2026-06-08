@@ -1,4 +1,4 @@
-// EVENT-DRIVEN LOW-POWER TEST BUILD
+// EVENT-DRIVEN LOW-POWER BUILD
 // MCU sleeps fully until button long-press triggers pairing mode.
 // On first BLE connect, dashboard sends SETTIME=<unix> to sync wall clock.
 // All stored readings use sleeptimer-based wall timestamps.
@@ -88,7 +88,7 @@ const uuid_128 SPP_DATA_CHAR_UUID = {
 // =============================================================================
 
 typedef enum {
-  STATE_DORMANT = 0,   // ← new: sleeping, not advertising
+  STATE_DORMANT = 0,   // sleeping, not advertising — waits for button long-press
   STATE_DISCONNECTED,
   STATE_ADVERTISING,
   STATE_CONNECTED,
@@ -160,7 +160,7 @@ static Adafruit_LTR390 g_ltr;
 static bool            g_sensor_ok = false;
 
 // =============================================================================
-// Backlog — now stores unix timestamp per reading
+// Backlog — stores unix timestamp per reading
 // =============================================================================
 
 typedef struct {
@@ -204,7 +204,7 @@ static void serviceRuntimeTasks();
 static bool systemCanSleep();
 static void enterIdleSleep();
 static void handleButtonBleDisconnectRequest();
-static void handleButtonPairingRequest();         // ← new
+static void handleButtonPairingRequest();
 static void handleSensorSampleEvent();
 static void processUvSample(uint32_t uvs, uint32_t als);
 static void handleSensorReadFailure();
@@ -252,7 +252,7 @@ void loop()
 
 // =============================================================================
 // System initialization
-// Note: sensor timer and BLE advertising are NOT started here.
+// Sensor timer and BLE advertising are NOT started here.
 // They start only after the user long-presses to enter pairing mode.
 // =============================================================================
 
@@ -321,7 +321,7 @@ static void initSensor()
 static void serviceRuntimeTasks()
 {
   motorLoop();
-  handleButtonPairingRequest();     // ← check for pairing trigger first
+  handleButtonPairingRequest();
   handleButtonBleDisconnectRequest();
   send_pending_readings();
 }
@@ -329,7 +329,12 @@ static void serviceRuntimeTasks()
 // =============================================================================
 // Pairing gate
 // The MCU stays in STATE_DORMANT until handleButtonPairingRequest() fires.
-// On first trigger: init GATT, start advertising, start sample timer.
+// On first trigger: start advertising and start the sample timer.
+//
+// FIX #2: ble_init_gatt_db() is NOT called here.
+// The GATT DB is built once inside sl_bt_evt_system_boot_id at stack boot.
+// Calling ble_init_gatt_db() a second time would invoke sl_bt_gattdb_new_session()
+// on an already-committed database, causing undefined behavior or a crash.
 // =============================================================================
 
 static void handleButtonPairingRequest()
@@ -337,13 +342,13 @@ static void handleButtonPairingRequest()
   if (!motorTakePairingRequest()) return;
 
   if (g_ble_state != STATE_DORMANT) {
-    // Already active — ignore
+    // Already active — ignore repeated long-press
     return;
   }
 
-  Serial.println("[SYSTEM] Pairing requested — starting BLE + sensor timer");
+  Serial.println("[SYSTEM] Pairing requested — starting BLE advertising + sensor timer");
 
-  ble_init_gatt_db();
+  // GATT DB was already initialized in sl_bt_evt_system_boot_id — do not call again.
   ble_start_advertising();
   start_sample_timer();
 
@@ -482,7 +487,7 @@ static bool should_store_reading(float uvi, float lux, uint32_t uv_raw, float se
 }
 
 // =============================================================================
-// Backlog storage — timestamps are wall time from sleeptimer clock
+// Backlog storage — timestamps use sleeptimer wall clock
 // =============================================================================
 
 static void store_reading(float uvi, float lux, uint32_t uv_raw, float sed)
@@ -496,7 +501,7 @@ static void store_reading(float uvi, float lux, uint32_t uv_raw, float sed)
   StoredReading& r = g_backlog[g_backlog_head];
 
   r.seq     = g_sample_seq++;
-  r.unix_ts = get_unix_time();       // ← wall time, survives sleep
+  r.unix_ts = get_unix_time();
   r.synced  = g_time_synced;
   r.uvi     = uvi;
   r.lux     = lux;
@@ -540,7 +545,6 @@ static void clear_backlog()
 // =============================================================================
 // Send pending readings
 // Packet format: SEQ=n T=unix UVI=x.x LUX=x.x UV=n SED=x.xxx SYNCED=1\n
-// Dashboard uses T= for display time. SYNCED=0 means clock wasn't set yet.
 // =============================================================================
 
 static void send_pending_readings()
@@ -660,7 +664,7 @@ static void apply_sed_threshold(float threshold)
 
 // =============================================================================
 // BLE command handler
-// Commands: RESET | SETSED=x.x | SETTIME=unix
+// Supported commands: RESET | SETSED=x.x | SETTIME=unix
 // =============================================================================
 
 static void handle_ble_command(const uint8_t* data, uint16_t len)
@@ -682,7 +686,6 @@ static void handle_ble_command(const uint8_t* data, uint16_t len)
     return;
   }
 
-  // Wall clock sync from dashboard
   if (strncmp(cmd, "SETTIME=", 8) == 0) {
     uint32_t unix_ts = (uint32_t)atol(cmd + 8);
     apply_wall_time(unix_ts);
@@ -801,9 +804,11 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
   switch (SL_BT_MSG_ID(evt->header)) {
 
     case sl_bt_evt_system_boot_id:
-      Serial.println("[BLE] Stack booted — waiting for button pairing trigger");
-      // Do NOT advertise or start timer here. Wait for button long-press.
-      ble_init_gatt_db();   // GATT DB must be built at boot
+      Serial.println("[BLE] Stack booted — waiting for button long-press to start");
+      // FIX #2: GATT DB is built HERE, once, at stack boot.
+      // handleButtonPairingRequest() must NOT call ble_init_gatt_db() again.
+      ble_init_gatt_db();
+      // Do NOT call ble_start_advertising() here — wait for button long-press.
       break;
 
     case sl_bt_evt_connection_opened_id:
@@ -855,7 +860,7 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
           digitalWrite(LED_BUILTIN, LED_BUILTIN_ACTIVE);
           Serial.println("[BLE] Notifications enabled — SPP mode active");
 
-          // Request time sync from dashboard immediately
+          // Request time sync from dashboard immediately after connecting.
           const char* req = "CMD=REQTIME\n";
           ble_send_chunked((const uint8_t*)req, strlen(req));
 
@@ -948,6 +953,7 @@ static void ble_start_advertising()
 
 // =============================================================================
 // GATT Database
+// Called once at sl_bt_evt_system_boot_id. Must not be called again.
 // =============================================================================
 
 static void ble_init_gatt_db()

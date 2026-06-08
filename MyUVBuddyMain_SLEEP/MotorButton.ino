@@ -1,5 +1,6 @@
 #include "MotorButton.h"
 #include "sl_sleeptimer.h"
+#include "sl_power_manager.h"   // FIX #3: needed for EM1 requirement to prevent PWM freeze in EM2 sleep
 
 // ─────────────────────────────────────────────
 // EVENT-DRIVEN BUTTON/HAPTIC MODULE
@@ -47,6 +48,10 @@ static volatile bool g_blePairingRequested = false;
 static uint8_t tapCount = 0;
 static unsigned long firstTapTime = 0;
 static unsigned long snoozeUntil = 0;
+
+// FIX #3: tracks whether an EM1 requirement is currently held.
+// Prevents double-add and double-release of the power manager requirement.
+static bool g_em1_required = false;
 
 // One-shot sleep timer used to wake the MCU for the next haptic/button event.
 static sl_sleeptimer_timer_handle_t g_motor_service_timer;
@@ -128,6 +133,9 @@ static void scheduleNextMotorService()
         scheduled = true;
     }
 
+    // FIX #4 (minor): use TRIPLE_TAP_MS as the tap window so only one wakeup
+    // is needed instead of two (the earlier DOUBLE_TAP_MS + 5 wakeup was
+    // redundant — scheduleNextMotorService already recalculates the remainder).
     if (tapCount > 0) {
         unsigned long elapsed = now - firstTapTime;
         unsigned long remaining = (elapsed > TRIPLE_TAP_MS)
@@ -162,15 +170,34 @@ static void scheduleNextMotorService()
 // ─────────────────────────────────────────────
 // MOTOR CONTROL
 // ─────────────────────────────────────────────
+
+// FIX #3: motorOff releases the EM1 requirement so the MCU can enter EM2 sleep.
+// The motor pin is guaranteed LOW before releasing, preventing the stuck-HIGH bug.
 static void motorOff()
 {
     analogWrite(MOTOR_PIN, PWM_OFF);
     motorState = MOTOR_IDLE;
     currentPulse = 0;
+
+    // Release EM1 power requirement — motor is off, EM2 sleep is now safe.
+    if (g_em1_required) {
+        sl_power_manager_remove_em_requirement(SL_POWER_MANAGER_EM1);
+        g_em1_required = false;
+    }
 }
 
+// FIX #3: motorStart acquires an EM1 requirement before enabling PWM.
+// This prevents sl_power_manager_sleep() from entering EM2 while the PWM
+// timer is running. EM2 halts HFRCO, which freezes the PWM peripheral and
+// leaves the motor pin stuck HIGH until the next explicit write.
 static void motorStart(const MotorPattern& p)
 {
+    // Block EM2 sleep for the duration of this haptic pattern.
+    if (!g_em1_required) {
+        sl_power_manager_add_em_requirement(SL_POWER_MANAGER_EM1);
+        g_em1_required = true;
+    }
+
     activePattern = p;
     currentPulse = 0;
     motorLastTime = millis();
@@ -202,7 +229,12 @@ static void motorUpdate()
                 currentPulse++;
 
                 if (currentPulse >= activePattern.pulses) {
+                    // Pattern complete — release EM1 requirement via motorOff path.
                     motorState = MOTOR_IDLE;
+                    if (g_em1_required) {
+                        sl_power_manager_remove_em_requirement(SL_POWER_MANAGER_EM1);
+                        g_em1_required = false;
+                    }
                 } else {
                     motorState = MOTOR_PULSE_OFF;
                     motorLastTime = now;
@@ -326,7 +358,7 @@ static void handleLongPress()
         motorStart(PAT_BLE_CANCELLED);
         Serial.println("[BTN] BLE disconnect requested");
     } else {
-        g_blePairingRequested = true;   // ← new flag
+        g_blePairingRequested = true;
         systemState = SYS_BLE_PAIRING;
         motorOff();
         motorStart(PAT_BLE_PAIRING);
@@ -509,9 +541,10 @@ void motorLoop()
                     tapCount = 3;
                 }
 
-                // Wake again when the tap window expires so the main loop does
-                // not need to keep polling for double/triple taps.
-                scheduleMotorServiceMs(DOUBLE_TAP_MS + 5);
+                // FIX #4 (minor): schedule wakeup at the full TRIPLE_TAP_MS window
+                // instead of DOUBLE_TAP_MS+5, eliminating an unnecessary early wakeup.
+                // scheduleNextMotorService() will refine this every loop iteration.
+                scheduleMotorServiceMs(TRIPLE_TAP_MS + 5);
             }
         }
     }
@@ -584,6 +617,8 @@ static void debugUpdate()
                 motorState == MOTOR_PULSE_ON ? "PULSE_ON" :
                                                "PULSE_OFF"
             );
+            Serial.print("[DBG] EM1 held = ");
+            Serial.println(g_em1_required ? "YES" : "NO");
             break;
 
         case 'P':
@@ -606,7 +641,7 @@ static void debugUpdate()
             Serial.println("  A      = Trigger UV alert");
             Serial.println("  B      = Simulate BLE connected");
             Serial.println("  S      = Show system state");
-            Serial.println("  M      = Show motor state");
+            Serial.println("  M      = Show motor state + EM1 status");
             Serial.println("  P<num> = Test SED vibration");
             Serial.println("Examples:");
             Serial.println("  P10");
